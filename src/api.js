@@ -16,7 +16,7 @@ const USER_AGENT = `dugganusa-checks-action/${VERSION}`;
 function clean(s, max = 300) {
   return String(s == null ? '' : s)
     // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁯﻿]|[\u{e0000}-\u{e007f}]/gu, ' ')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]|[\u{e0000}-\u{e007f}]/gu, ' ')
     .replace(/\s+/g, ' ').trim().slice(0, max);
 }
 

@@ -154,7 +154,9 @@ test('MCP configs: npx, uvx, docker, url, VS Code servers key', () => {
     servers: { vs: { command: 'npx', args: ['some-mcp'] } },
   }));
   const mcp = [...m.values()].filter(i => i.kind === 'mcp').map(i => `${i.key}=${i.server}@${i.version || ''}`).sort();
-  assert.deepEqual(mcp, ['fetch=mcp-server-fetch@', 'github=@modelcontextprotocol/server-github@2025.4.8', 'grafana=grafana@1.0.0', 'remote=remote@', 'vs=some-mcp@']);
+  assert.deepEqual(mcp, ['fetch=mcp-server-fetch@', 'github=@modelcontextprotocol/server-github@2025.4.8', 'grafana=grafana@1.0.0', 'vs=some-mcp@']);
+  // a remote server has no package identity: UNKNOWN, never judged by its (attacker-chosen) key
+  assert.ok(skips(m).find(x => x.unverifiable && x.spec === 'remote' && /mcp\.example\.com/.test(x.reason)));
   // the npx/uvx packages are also checked as packages
   assert.deepEqual(pkgs(m), ['npm:@modelcontextprotocol/server-github@2025.4.8', 'npm:some-mcp@', 'pypi:mcp-server-fetch@']);
 });
@@ -164,7 +166,9 @@ test('diffItems: only added or changed entries', () => {
   const after = JSON.stringify({ dependencies: { a: '1.0.0', b: '^2.1.0', c: '3.0.0' } });
   const { items } = p.diffItems('package.json', before, after);
   assert.deepEqual(items.map(i => `${i.name}:${i.change}`).sort(), ['b:changed', 'c:added']);
-  const bad = p.diffItems('package.json', before, '{not json');
-  assert.equal(bad.items.length, 0);
+  const bad = p.diffItems('package.json', before, '{not json', { file: 'package.json' });
   assert.equal(bad.errors.length, 1);
+  // an unparseable manifest is an UNKNOWN finding, not just a note
+  assert.equal(bad.items.length, 1);
+  assert.ok(bad.items[0].kind === 'skip' && bad.items[0].unverifiable);
 });

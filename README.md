@@ -49,6 +49,10 @@ A fuller example with `paths:` filters is in [`examples/dugganusa-checks.yml`](e
 
 Sources that cannot be judged by name are never silently dropped. A git URL, a tarball URL, a private index or a per-gem `source:` is reported as **UNKNOWN**, because the registry name we would check is not what your installer fetches.
 
+The parsers follow what the installer actually does, and anything they cannot classify is UNKNOWN rather than skipped: duplicate JSON keys, a lockfile entry whose `resolved` URL fetches a different package (that package is checked instead), `overrides`/`resolutions`, `-i`/`--index-url` (every package in the file becomes UNKNOWN), `-r` includes (followed inside the repository), `tool.uv.sources`, Poetry primary sources, Gemfile lines that are Ruby code rather than plain `gem` calls, and MCP servers launched by anything other than a recognized `npx`/`uvx`/`docker run` command. A remote (URL) MCP server is UNKNOWN: its config key is attacker-chosen text, not an identity. Lockfile formats we do not parse (`yarn.lock`, `pnpm-lock.yaml`, `uv.lock`, `Pipfile.lock`, ...) and installer config that redirects a registry (`.npmrc`, `pip.conf`, `uv.toml`, ...) are reported as UNKNOWN when they change.
+
+Files are read only if they are regular files inside the workspace: symlinks, FIFOs, devices and files over 32 MB are refused and reported as UNKNOWN.
+
 ## Verdicts and the job status
 
 | Verdict | Means | Default job effect |

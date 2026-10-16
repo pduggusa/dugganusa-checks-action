@@ -21,7 +21,11 @@ async function main() {
   const ratePerMin = parseInt(gha.getInput('rate-per-minute', '0'), 10) || undefined;
   const maxWaitMs = Math.max(0, parseInt(gha.getInput('max-wait-seconds', '300'), 10) || 0) * 1000;
   const checkMcp = gha.getBool('check-mcp', true);
-  const workdir = path.resolve(process.env.GITHUB_WORKSPACE || process.cwd(), gha.getInput('working-directory', '.'));
+  const workspace = fs.realpathSync(process.env.GITHUB_WORKSPACE || process.cwd());
+  const wdInput = gha.getInput('working-directory', '.');
+  const workdir = fs.realpathSync(path.resolve(workspace, wdInput));
+  if (workdir !== workspace && !workdir.startsWith(workspace + path.sep)) throw new Error('working-directory must be inside the workspace');
+  const annFile = (f) => path.posix.join(wdInput.replace(/\\/g, '/'), String(f)).replace(/^\.\//, '');
   const baseInput = gha.getInput('base-ref');
   const apiBase = gha.getInput('api-base', 'https://analytics.dugganusa.com');
 
@@ -31,14 +35,14 @@ async function main() {
     gha.annotate('warning', `Base commit ${modeInfo.base.slice(0, 12)} is not available (use actions/checkout with fetch-depth: 0 or 2); falling back to a full scan.`, { title: 'DugganUSA Checks' });
     modeInfo = { mode: 'full', base: null, reason: 'base commit unavailable; scanned everything' };
   }
-  console.log(`DugganUSA Checks: ${modeInfo.reason}`);
+  gha.log(`DugganUSA Checks: ${modeInfo.reason}`);
 
   const { items, notes, files, texts, transitive } = run.collect({ cwd: workdir, mode: modeInfo.mode, base: modeInfo.base, includeTransitive, checkMcp });
-  console.log(`DugganUSA Checks: ${files.length} manifest/config file(s), ${items.length} item(s) to check`);
+  gha.log(`DugganUSA Checks: ${files.length} manifest/config file(s), ${items.length} item(s) to check`);
 
-  const client = new run.Client({ apiBase, apiKey, packageRatePerMin: ratePerMin, maxWaitMs, log: (m) => console.log(`  ${m}`) });
+  const client = new run.Client({ apiBase, apiKey, packageRatePerMin: ratePerMin, maxWaitMs, log: (m) => gha.log(`  ${m}`) });
   gha.group('Lookups');
-  const results = await run.check(items, client, { maxLookups, log: (m) => console.log(`  ${m}`) });
+  const results = await run.check(items, client, { maxLookups, log: (m) => gha.log(`  ${m}`) });
   gha.endGroup();
 
   const { counts, failed, failing } = run.decide(results, { failOn, failOnUnknown });
@@ -50,12 +54,12 @@ async function main() {
     const ev = (r.evidence || []).length ? ` Evidence: ${r.evidence.join(', ')}.` : '';
     const level = failing(r.verdict) ? 'error' : 'warning';
     const lead = r.verdict === 'UNKNOWN' ? 'UNKNOWN (not judged, NOT a pass)' : r.verdict;
-    gha.annotate(level, `${lead}: ${name}. ${String(r.reason).replace(/[.\s]+$/, "")}.${ev}`, { file: path.posix.join(gha.getInput('working-directory', '.'), i.files[0]).replace(/^\.\//, ''), line: i.line, title: `DugganUSA Checks: ${r.verdict}` });
+    gha.annotate(level, `${lead}: ${name}. ${String(r.reason).replace(/[.\s]+$/, "")}.${ev}`, { file: annFile(i.files[0]), line: i.line, title: `DugganUSA Checks: ${r.verdict}` });
   }
-  for (const n of notes) if (n.level === 'warning') gha.annotate('warning', n.text, { file: n.file, title: 'DugganUSA Checks' });
+  for (const n of notes) if (n.level === 'warning') gha.annotate('warning', n.text, { file: annFile(n.file), title: 'DugganUSA Checks' });
 
   const md = run.summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, keyed: !!apiKey, client, transitive });
-  if (!gha.appendSummary(md)) console.log('\n' + md);
+  if (!gha.appendSummary(md)) for (const l of md.split('\n')) gha.log(l);
 
   const report = { mode: modeInfo.mode, base: modeInfo.base, failed, counts, api_calls: client.calls, rate_limited: client.rateLimited,
     results: results.map(r => ({ verdict: r.verdict, api_verdict: r.api_verdict || null, type: r.item.kind === 'mcp' ? 'mcp' : r.item.kind === 'skip' ? 'source' : r.item.ecosystem, name: run.label(r.item), version: r.item.version || null, files: r.item.files, transitive: !!r.item.transitive, reason: r.reason, evidence: r.evidence || [], signature: r.signature || null })) };
@@ -68,7 +72,7 @@ async function main() {
   gha.setOutput('allow-count', String(counts.ALLOW));
   gha.setOutput('report-path', reportPath);
 
-  console.log(`DugganUSA Checks: ${counts.BLOCK} block, ${counts.ADVISORY} advisory, ${counts.REVIEW} review, ${counts.UNKNOWN} unknown, ${counts.ALLOW} allow -> ${failed ? 'FAIL' : 'pass'}`);
+  gha.log(`DugganUSA Checks: ${counts.BLOCK} block, ${counts.ADVISORY} advisory, ${counts.REVIEW} review, ${counts.UNKNOWN} unknown, ${counts.ALLOW} allow -> ${failed ? 'FAIL' : 'pass'}`);
   if (failed) process.exitCode = 1;
 }
 

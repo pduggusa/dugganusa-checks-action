@@ -22,15 +22,30 @@ function getBool(name, def = false) {
 function escData(s) { return String(s).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A'); }
 function escProp(s) { return escData(s).replace(/:/g, '%3A').replace(/,/g, '%2C'); }
 
+// Untrusted text (repository content, file names, API responses) on its way to stdout: strip
+// control, bidi, zero-width and line-separator characters and break "::" so it can never form,
+// or be mistaken for, a workflow command such as ::stop-commands:: or ::add-mask::.
+function neutralize(s, max = 2000) {
+  return String(s == null ? '' : s)
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]|[\u{e0000}-\u{e007f}]/gu, ' ')
+    .replace(/::/g, ':\u00a0:')
+    .replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+// A log line whose untrusted parts were already passed through neutralize() still goes through
+// it again here: belt and braces, since one missed call site is a command-injection bug.
+function log(line) { console.log(neutralize(line, 4000)); }
+
 function inActions() { return process.env.GITHUB_ACTIONS === 'true'; }
 
 function annotate(level, message, { file, line, title } = {}) {
-  if (!inActions()) { console.log(`[${level.toUpperCase()}]${file ? ' ' + file + (line ? ':' + line : '') : ''} ${message}`); return; }
+  if (!inActions()) { log(`[${level.toUpperCase()}]${file ? ' ' + file + (line ? ':' + line : '') : ''} ${message}`); return; }
   const props = [];
   if (file) props.push(`file=${escProp(file)}`);
   if (line) props.push(`line=${Number(line)}`);
   if (title) props.push(`title=${escProp(title)}`);
-  console.log(`::${level}${props.length ? ' ' + props.join(',') : ''}::${escData(message)}`);
+  console.log(`::${level}${props.length ? ' ' + props.join(',') : ''}::${escData(neutralize(message, 4000))}`);
 }
 
 function mask(secret) { if (secret && inActions()) console.log(`::add-mask::${escData(secret)}`); }
@@ -49,7 +64,7 @@ function appendSummary(markdown) {
   return true;
 }
 
-function group(name) { if (inActions()) console.log(`::group::${escData(name)}`); else console.log(`--- ${name}`); }
+function group(name) { if (inActions()) console.log(`::group::${escData(neutralize(name))}`); else log(`--- ${name}`); }
 function endGroup() { if (inActions()) console.log('::endgroup::'); }
 
-module.exports = { getInput, getBool, escData, escProp, annotate, mask, setOutput, appendSummary, group, endGroup, inActions };
+module.exports = { getInput, getBool, escData, escProp, neutralize, log, annotate, mask, setOutput, appendSummary, group, endGroup, inActions };
