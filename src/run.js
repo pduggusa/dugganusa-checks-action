@@ -171,19 +171,35 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
     for (const e of errors) notes.push({ file: f, text: `${f} ${e}`, level: 'warning' });
     for (const it of items) addItem(f, it, newText);
   }
-  // npx runs a package of the same name from this repository (a workspace member, or a file:/git/
-  // alias dependency installed into node_modules) instead of fetching the registry package we
-  // judge. Every package.json in the repository is read for this, changed or not.
+  // npx (npm exec) prefers an executable already in the project (node_modules/.bin: bins of every
+  // dependency and workspace, and the root package's own bin) over the registry package we judge.
+  // Every package.json and npm lockfile in the repository is read for this, changed or not, and a
+  // committed node_modules/.bin entry counts too. Match on the full and the unscoped name.
   const npx = [...byKey.entries()].filter(([, i]) => i.kind === 'mcp' && i.via === 'npx');
   if (npx.length) {
     const shadow = new Set();
+    const binFiles = new Set();
     for (const f of listFiles(cwd)) {
-      if (parsers.manifestKind(f) !== 'package.json') continue;
-      try { for (const n of parsers.localNpmNames(parsers.decode('package.json', safeRead(cwd, f)))) shadow.add(n); } catch { /* unreadable: reported elsewhere if changed */ }
+      const bm = /(^|\/)node_modules\/\.bin\/([^/]+?)(\.cmd|\.ps1)?$/i.exec(f);
+      if (bm) { binFiles.add(bm[2].toLowerCase()); continue; }
+      const kind = parsers.manifestKind(f);
+      if (kind !== 'package.json' && kind !== 'package-lock') continue;
+      try {
+        const text = parsers.decode(kind, safeRead(cwd, f));
+        for (const n of (kind === 'package.json' ? parsers.localNpmNames(text) : parsers.lockfileNpmNames(text))) shadow.add(n);
+      } catch { /* unreadable: reported elsewhere if changed */ }
     }
     for (const [k, i] of npx) {
-      if (!shadow.has(String(i.server).toLowerCase())) continue;
-      byKey.set(k, { ...parsers.unknown(i.key, `MCP server "${i.key}": npx package "${i.server}" has the same name as a package or non-registry dependency in this repository, so npx may run the local copy instead of the registry package`), files: i.files, line: i.line, change: i.change });
+      const full = String(i.server).toLowerCase();
+      const short = full.replace(/^@[^/]+\//, '');
+      let why = null;
+      if (binFiles.has(short) || binFiles.has(full)) why = `a committed node_modules/.bin/${short} exists`;
+      else {
+        try { fs.lstatSync(path.join(cwd, 'node_modules', '.bin', short)); why = `node_modules/.bin/${short} exists in the workspace`; } catch { /* absent */ }
+      }
+      if (!why && (shadow.has(full) || shadow.has(short))) why = `a package, dependency or bin named "${shadow.has(full) ? full : short}" is declared in this repository`;
+      if (!why) continue;
+      byKey.set(k, { ...parsers.unknown(i.key, `MCP server "${i.key}": npx package "${i.server}" may run local code instead of the registry package (${why}; npm exec prefers a matching local executable)`), files: i.files, line: i.line, change: i.change });
     }
   }
   let items = [...byKey.values()];

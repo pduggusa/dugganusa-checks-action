@@ -917,23 +917,57 @@ function fromMcpConfig(text) {
   return m;
 }
 
-// Names npx could resolve to code in this repository instead of the registry: the "name" of every
-// package.json (workspace members are linked into node_modules) and every dependency whose spec is
-// not a plain registry range (file:, link:, git, tarball, alias...). INVARIANT for finding 8: an
-// npx MCP server whose package name is in this set is unknown:ambiguous.
+// Names npx (npm exec) could resolve to an executable already in this project instead of the
+// registry package we judge. npm exec prefers a matching bin in the project's node_modules/.bin,
+// which holds the bins of EVERY installed dependency and workspace (bin names need not equal
+// package names) and the root package's own bin. INVARIANT: an npx MCP server whose package name
+// or unscoped name is in this set is unknown:ambiguous. The set holds:
+//   - the "name" of every package.json (the root and each workspace member),
+//   - every "bin" name declared by any package.json (a string bin is named after the package),
+//   - every dependency name of any package.json: we do not know a dependency's bins from the
+//     manifest, so a same-named dependency is ambiguous (its bins come from the lockfile below).
+const binNames = (pkgName, bin) => {
+  const out = [];
+  if (typeof bin === 'string' && typeof pkgName === 'string') out.push(pkgName.replace(/^@[^/]+\//, ''));
+  else if (isObj(bin)) out.push(...Object.keys(bin));
+  return out.map(n => n.toLowerCase());
+};
 function localNpmNames(text) {
   const names = new Set();
   let j;
   try { j = parseJson(text).value; } catch { return names; }
   if (!isObj(j)) return names;
   if (typeof j.name === 'string') names.add(j.name.toLowerCase());
+  for (const b of binNames(j.name, j.bin)) names.add(b);
   for (const sec of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
     if (!isObj(j[sec])) continue;
-    for (const [n, spec] of Object.entries(j[sec])) {
-      const p = typeof spec === 'string' ? npmFromRange(n, spec) : null;
-      if (!p || p.kind !== 'package' || p.alias) names.add(n.toLowerCase());
+    for (const n of Object.keys(j[sec])) names.add(n.toLowerCase());
+  }
+  return names;
+}
+
+// The same from a lockfile: v2/v3 record each installed package's "bin" map, so a dependency named
+// "evil-tools" that installs a bin "mcp-server-github" is caught; v1 has no bin data, so only the
+// installed package names are added (a same-named dependency is ambiguous; a differently-named bin
+// in a v1-only project is not visible, see README).
+function lockfileNpmNames(text) {
+  const names = new Set();
+  let j;
+  try { j = parseJson(text).value; } catch { return names; }
+  if (!isObj(j)) return names;
+  if (isObj(j.packages)) {
+    for (const [p, info] of Object.entries(j.packages)) {
+      if (!isObj(info)) continue;
+      const nm = typeof info.name === 'string' ? info.name : p.includes('node_modules/') ? p.slice(p.lastIndexOf('node_modules/') + 13) : null;
+      if (nm) names.add(nm.toLowerCase());
+      for (const b of binNames(nm, info.bin)) names.add(b);
     }
   }
+  const walk = (deps, depth) => {
+    if (!isObj(deps) || depth > MAX_LOCK_DEPTH) return;
+    for (const [n, info] of Object.entries(deps)) { names.add(n.toLowerCase()); if (isObj(info)) walk(info.dependencies, depth + 1); }
+  };
+  walk(j.dependencies, 0);
   return names;
 }
 
@@ -1009,5 +1043,5 @@ module.exports = {
   EXACT_SEMVER, pep503, pkgKey, manifestKind, parseNpmSpec, npmFromRange, parsePipSpec, parse, diffItems, decode,
   pipLogicalLines, npmRegistryIdentity,
   fromPackageJson, fromPackageLock, fromRequirements, fromPyproject, fromPoetryLock, fromGemfile, fromGemfileLock, fromMcpConfig,
-  canonicalLaunch, localNpmNames, unknown, notInCorpus,
+  canonicalLaunch, localNpmNames, lockfileNpmNames, unknown, notInCorpus,
 };
