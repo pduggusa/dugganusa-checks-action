@@ -16,7 +16,7 @@ function startStub() {
     let body = '';
     req.on('data', c => { body += c; });
     req.on('end', () => {
-      seen.push({ url: req.url, auth: req.headers.authorization || null });
+      seen.push({ url: req.url, auth: req.headers.authorization || null, repo: req.headers['x-dugganusa-repo'] || null, ua: req.headers['user-agent'] || null, body });
       res.setHeader('Content-Type', 'application/json');
       if (req.url.startsWith('/api/v1/mcp')) {
         const a = JSON.parse(body).params.arguments;
@@ -54,7 +54,7 @@ function repo() {
   return { dir, base };
 }
 
-function runAction(dir, base, apiBase, inputs = {}, eventName = 'pull_request') {
+function runAction(dir, base, apiBase, inputs = {}, eventName = 'pull_request', extraEnv = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dusa-gh-'));
   const eventPath = path.join(tmp, 'event.json');
   fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { base: { sha: base } } }));
@@ -63,6 +63,7 @@ function runAction(dir, base, apiBase, inputs = {}, eventName = 'pull_request') 
     GITHUB_WORKSPACE: dir, GITHUB_STEP_SUMMARY: summary, GITHUB_OUTPUT: output, RUNNER_TEMP: tmp,
     'INPUT_API-BASE': apiBase, 'INPUT_RATE-PER-MINUTE': '60000' };
   for (const [k, v] of Object.entries(inputs)) env[`INPUT_${k.toUpperCase()}`] = v;
+  Object.assign(env, extraEnv);
   return new Promise((resolve) => {
     const p = spawn(process.execPath, [ENTRY], { cwd: dir, env });
     let out = ''; p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { out += d; });
@@ -135,4 +136,23 @@ test('API down: everything UNKNOWN; unchecked fails by default, passes only with
   const off = await runAction(dir, base, 'http://127.0.0.1:9', { 'max-wait-seconds': '0', 'fail-on-unchecked': 'false' });
   assert.equal(off.code, 0);
   assert.match(off.summary, /not judged and are not a pass/);
+});
+
+test('e2e: GITHUB_REPOSITORY becomes the opaque x-dugganusa-repo marker on every call; raw name never sent; absent when unset', async () => {
+  const { repoMarker, USER_AGENT } = require('../src/api');
+  const stub = await startStub();
+  try {
+    const { dir, base } = repo();
+    await runAction(dir, base, stub.base, {}, 'pull_request', { GITHUB_REPOSITORY: 'Octo-Org/Secret-Repo' });
+    assert.ok(stub.seen.length >= 2);
+    assert.ok(stub.seen.some(s => s.url.startsWith('/api/v1/mcp')) && stub.seen.some(s => s.url.startsWith('/api/v1/dredd/preflight')));
+    for (const s of stub.seen) {
+      assert.equal(s.repo, repoMarker('octo-org/secret-repo'));
+      assert.equal(s.ua, USER_AGENT);
+      assert.ok(!/octo-org|secret-repo/i.test(s.url + s.body), 'raw repository name never on the wire');
+    }
+    stub.seen.length = 0;
+    await runAction(dir, base, stub.base, {});
+    assert.ok(stub.seen.length >= 2 && stub.seen.every(s => s.repo === null));
+  } finally { stub.server.close(); }
 });

@@ -1,7 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { Client, normalizeDredd, normalizePackage, clean } = require('../src/api');
+const { Client, normalizeDredd, normalizePackage, clean, repoMarker, USER_AGENT } = require('../src/api');
+const crypto = require('crypto');
 
 // Fake fetch: routes check-package and Dredd preflight to canned responses; records calls.
 function stub({ packages = {}, servers = {}, script = [] } = {}) {
@@ -131,4 +132,41 @@ test('clean strips control, bidi and zero-width characters (no workflow-command 
 
 test('rejects a non-https api-base', () => {
   assert.throws(() => new Client({ apiBase: 'http://evil.example' }));
+});
+
+test('repo marker: sha256 of the lowercase repository, first 16 hex chars', () => {
+  const want = crypto.createHash('sha256').update('octo-org/my-repo').digest('hex').slice(0, 16);
+  assert.equal(repoMarker('Octo-Org/My-Repo'), want);
+  assert.equal(repoMarker('octo-org/my-repo'), want);
+  assert.match(want, /^[0-9a-f]{16}$/);
+  assert.equal(repoMarker(''), null);
+  assert.equal(repoMarker(undefined), null);
+  assert.equal(repoMarker('   '), null);
+});
+
+test('x-dugganusa-repo is sent on BOTH check-package and Dredd preflight, never the raw name', async () => {
+  const s = stub();
+  const c = new Client({ repository: 'Octo-Org/My-Repo', fetchImpl: s.fetchImpl, ...fast });
+  await c.checkPackage({ ecosystem: 'npm', name: 'x', version: '1.0.0' });
+  await c.checkMcpServer({ server: 'y' });
+  assert.equal(s.calls.length, 2);
+  for (const call of s.calls) {
+    assert.equal(call.init.headers['x-dugganusa-repo'], repoMarker('octo-org/my-repo'));
+    assert.equal(call.init.headers['User-Agent'], USER_AGENT);
+    const wire = JSON.stringify({ url: call.url, headers: call.init.headers, body: call.init.body || '' }).toLowerCase();
+    assert.ok(!wire.includes('octo-org'), 'raw owner must never be sent');
+    assert.ok(!wire.includes('my-repo'), 'raw repo name must never be sent');
+  }
+});
+
+test('no repository -> no x-dugganusa-repo header', async () => {
+  const s = stub();
+  const c = new Client({ fetchImpl: s.fetchImpl, ...fast });
+  await c.checkPackage({ ecosystem: 'npm', name: 'x' });
+  await c.checkMcpServer({ server: 'y' });
+  for (const call of s.calls) assert.ok(!('x-dugganusa-repo' in call.init.headers));
+});
+
+test('User-Agent carries the package.json version', () => {
+  assert.equal(USER_AGENT, `dugganusa-checks-action/${require('../package.json').version}`);
 });

@@ -8,7 +8,9 @@
 // Auth: optional key, sent ONLY as "Authorization: Bearer". Never as a query string.
 // Any failure (429 past the wait budget, 5xx, timeout, bad JSON) becomes UNKNOWN, never ALLOW.
 
-const VERSION = '1.0.0';
+const crypto = require('crypto');
+
+const VERSION = '1.0.1';
 const USER_AGENT = `dugganusa-checks-action/${VERSION}`;
 
 // Strip control, zero-width, bidi and tag characters from API text before it reaches a log,
@@ -20,13 +22,23 @@ function clean(s, max = 300) {
     .replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
+// Opaque repository marker: first 16 hex chars of sha256(lowercase owner/name). Lets the API count
+// distinct adopting repositories (and exclude our own CI) without ever receiving the name.
+// Empty/unset repository -> null -> no header.
+function repoMarker(repository) {
+  const r = String(repository == null ? '' : repository).trim().toLowerCase();
+  if (!r) return null;
+  return crypto.createHash('sha256').update(r, 'utf8').digest('hex').slice(0, 16);
+}
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 class Client {
-  constructor({ apiBase = 'https://analytics.dugganusa.com', apiKey = '', fetchImpl = globalThis.fetch, packageRatePerMin, mcpRatePerMin = 30, maxWaitMs = 300000, timeoutMs = 20000, sleepImpl = sleep, now = () => Date.now(), log = () => {} } = {}) {
+  constructor({ apiBase = 'https://analytics.dugganusa.com', apiKey = '', repository = '', fetchImpl = globalThis.fetch, packageRatePerMin, mcpRatePerMin = 30, maxWaitMs = 300000, timeoutMs = 20000, sleepImpl = sleep, now = () => Date.now(), log = () => {} } = {}) {
     this.base = String(apiBase).replace(/\/+$/, '');
     if (!/^https:\/\//.test(this.base) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(this.base)) throw new Error('api-base must be an https:// URL');
     this.apiKey = apiKey || '';
+    this.repoMarker = repoMarker(repository);
     this.fetch = fetchImpl;
     this.sleep = sleepImpl;
     this.now = now;
@@ -45,6 +57,7 @@ class Client {
   headers(extra = {}) {
     const h = { 'User-Agent': USER_AGENT, Accept: 'application/json', ...extra };
     if (this.apiKey) h.Authorization = `Bearer ${this.apiKey}`;
+    if (this.repoMarker) h['x-dugganusa-repo'] = this.repoMarker;
     return h;
   }
 
@@ -173,4 +186,4 @@ function normalizeDredd(d) {
   return { verdict, api_verdict: V || null, reason, evidence, signature: d.signature ? clean(d.signature, 80) : null, known_to_us: known, dep_graph_scanned: scanned };
 }
 
-module.exports = { Client, normalizePackage, normalizeDredd, clean, USER_AGENT, VERSION };
+module.exports = { Client, normalizePackage, normalizeDredd, clean, repoMarker, USER_AGENT, VERSION };

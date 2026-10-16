@@ -128,9 +128,16 @@ Every ambiguous MCP entry prints its fingerprint in the summary's Evidence colum
 
 The Action works without a key. Keyless package checks share the anonymous rate (currently 10 per minute and 50 per day per source IP), and GitHub-hosted runners share egress IPs with other users, so a large PR or a full scan can run out. The Action paces itself under the per-minute cap, waits out a per-minute 429, and reports anything it could not check as UNKNOWN. It never reports an unchecked package as a pass. A free account key raises the limits; see the pricing page at analytics.dugganusa.com/pricing.
 
-## Privacy
+## Privacy: what we receive
 
-The Action sends package names, versions, ecosystems and MCP server names to `analytics.dugganusa.com`. It does not send file contents, repository names or source code.
+Every API call to `analytics.dugganusa.com` carries only:
+
+- **The thing being checked:** package ecosystem, name and version (check-package), or MCP server name and version (Dredd preflight).
+- **`User-Agent: dugganusa-checks-action/<version>`**, so the API can tell Action traffic from other callers.
+- **`x-dugganusa-repo: <marker>`**, an opaque repository marker: the first 16 hex characters of the SHA-256 of the lowercase `GITHUB_REPOSITORY` (`owner/name`). It lets us count distinct repositories using the Action and leave our own CI out of that count. The raw repository name is never sent. The header is omitted when `GITHUB_REPOSITORY` is not set. A marker is a hash of a short, guessable string, so treat it as pseudonymous, not anonymous: anyone who already knows a repository name can compute its marker.
+- **`Authorization: Bearer <key>`**, only if you set `api-key`.
+
+It does not send file contents, diffs, commit messages, repository names or source code, so no verdict is stored alongside your code: the API only ever sees the identifiers above.
 
 ## Development
 
