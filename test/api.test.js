@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { Client, normalizeDredd, normalizePackage, clean, repoMarker, USER_AGENT } = require('../src/api');
+const { Client, normalizeDredd, normalizePackage, clean, repoMarker, publicRepository, USER_AGENT } = require('../src/api');
 const crypto = require('crypto');
 
 // Fake fetch: routes check-package and Dredd preflight to canned responses; records calls.
@@ -169,4 +169,28 @@ test('no repository -> no x-dugganusa-repo header', async () => {
 
 test('User-Agent carries the package.json version', () => {
   assert.equal(USER_AGENT, `dugganusa-checks-action/${require('../package.json').version}`);
+});
+
+test('publicRepository: marker only for a repository the event payload says is public', () => {
+  const R = 'Octo-Org/My-Repo';
+  // public
+  assert.equal(publicRepository({ repository: { full_name: R, private: false } }, R), R);
+  assert.equal(publicRepository({ repository: { full_name: R, private: false, visibility: 'public' } }, R), R);
+  assert.equal(publicRepository({ repository: { visibility: 'public' } }, R), R);
+  // private
+  assert.equal(publicRepository({ repository: { full_name: R, private: true, visibility: 'private' } }, R), null);
+  assert.equal(publicRepository({ repository: { full_name: R, private: true } }, R), null);
+  // internal (GitHub Enterprise: private=true, visibility=internal) and contradictory payloads
+  assert.equal(publicRepository({ repository: { full_name: R, private: true, visibility: 'internal' } }, R), null);
+  assert.equal(publicRepository({ repository: { full_name: R, private: false, visibility: 'internal' } }, R), null);
+  assert.equal(publicRepository({ repository: { full_name: R, private: true, visibility: 'public' } }, R), null);
+  // missing / unreadable payload, no visibility info, wrong repo, no GITHUB_REPOSITORY
+  assert.equal(publicRepository({}, R), null);
+  assert.equal(publicRepository(null, R), null);
+  assert.equal(publicRepository(undefined, R), null);
+  assert.equal(publicRepository({ repository: { full_name: R } }, R), null);
+  assert.equal(publicRepository({ repository: 'octo-org/my-repo' }, R), null);
+  assert.equal(publicRepository({ repository: { full_name: 'other/repo', private: false } }, R), null);
+  assert.equal(publicRepository({ repository: { private: false } }, ''), null);
+  assert.equal(publicRepository({ repository: { private: false } }, undefined), null);
 });

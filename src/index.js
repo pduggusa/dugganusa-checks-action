@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const gha = require('./gha');
 const run = require('./run');
+const { publicRepository } = require('./api');
 
 async function main() {
   const apiKey = gha.getInput('api-key');
@@ -44,7 +45,7 @@ async function main() {
   const { items, notes, files, texts, transitive } = run.collect({ cwd: workdir, mode: modeInfo.mode, base: modeInfo.base, includeTransitive, checkMcp, allowAmbiguous });
   gha.log(`DugganUSA Checks: ${files.length} manifest/config file(s), ${items.length} item(s) to check`);
 
-  const client = new run.Client({ apiBase, apiKey, repository: process.env.GITHUB_REPOSITORY || '', packageRatePerMin: ratePerMin, maxWaitMs, log: (m) => gha.log(`  ${m}`) });
+  const client = new run.Client({ apiBase, apiKey, repository: publicRepository(event, process.env.GITHUB_REPOSITORY), packageRatePerMin: ratePerMin, maxWaitMs, log: (m) => gha.log(`  ${m}`) });
   gha.group('Lookups');
   const results = await run.check(items, client, { maxLookups, log: (m) => gha.log(`  ${m}`) });
   gha.endGroup();

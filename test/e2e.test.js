@@ -54,10 +54,10 @@ function repo() {
   return { dir, base };
 }
 
-function runAction(dir, base, apiBase, inputs = {}, eventName = 'pull_request', extraEnv = {}) {
+function runAction(dir, base, apiBase, inputs = {}, eventName = 'pull_request', extraEnv = {}, eventExtra = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dusa-gh-'));
   const eventPath = path.join(tmp, 'event.json');
-  fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { base: { sha: base } } }));
+  fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { base: { sha: base } }, ...eventExtra }));
   const summary = path.join(tmp, 'summary.md'); const output = path.join(tmp, 'output.txt');
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: eventName, GITHUB_EVENT_PATH: eventPath,
     GITHUB_WORKSPACE: dir, GITHUB_STEP_SUMMARY: summary, GITHUB_OUTPUT: output, RUNNER_TEMP: tmp,
@@ -138,21 +138,34 @@ test('API down: everything UNKNOWN; unchecked fails by default, passes only with
   assert.match(off.summary, /not judged and are not a pass/);
 });
 
-test('e2e: GITHUB_REPOSITORY becomes the opaque x-dugganusa-repo marker on every call; raw name never sent; absent when unset', async () => {
+test('e2e: x-dugganusa-repo is sent only for a PUBLIC repository; private, internal and missing payload send none; raw name never sent', async () => {
   const { repoMarker, USER_AGENT } = require('../src/api');
   const stub = await startStub();
   try {
     const { dir, base } = repo();
-    await runAction(dir, base, stub.base, {}, 'pull_request', { GITHUB_REPOSITORY: 'Octo-Org/Secret-Repo' });
-    assert.ok(stub.seen.length >= 2);
-    assert.ok(stub.seen.some(s => s.url.startsWith('/api/v1/mcp')) && stub.seen.some(s => s.url.startsWith('/api/v1/dredd/preflight')));
-    for (const s of stub.seen) {
+    const env = { GITHUB_REPOSITORY: 'Octo-Org/Secret-Repo' };
+    const run1 = async (repository) => { stub.seen.length = 0; await runAction(dir, base, stub.base, {}, 'pull_request', env, repository === undefined ? {} : { repository }); return stub.seen.slice(); };
+    const pub = await run1({ full_name: 'Octo-Org/Secret-Repo', private: false, visibility: 'public' });
+    assert.ok(pub.some(s => s.url.startsWith('/api/v1/mcp')) && pub.some(s => s.url.startsWith('/api/v1/dredd/preflight')));
+    for (const s of pub) {
       assert.equal(s.repo, repoMarker('octo-org/secret-repo'));
       assert.equal(s.ua, USER_AGENT);
       assert.ok(!/octo-org|secret-repo/i.test(s.url + s.body), 'raw repository name never on the wire');
     }
+    for (const repository of [
+      { full_name: 'Octo-Org/Secret-Repo', private: true, visibility: 'private' },
+      { full_name: 'Octo-Org/Secret-Repo', private: true, visibility: 'internal' },
+      undefined, // payload has no repository object
+    ]) {
+      const seen = await run1(repository);
+      assert.ok(seen.length >= 2);
+      assert.ok(seen.every(s => s.repo === null), `no marker for ${JSON.stringify(repository)}`);
+      assert.ok(seen.every(s => !/octo-org|secret-repo/i.test(s.url + s.body)));
+    }
+    // unreadable event payload path
     stub.seen.length = 0;
-    await runAction(dir, base, stub.base, {});
-    assert.ok(stub.seen.length >= 2 && stub.seen.every(s => s.repo === null));
+    await runAction(dir, base, stub.base, { mode: 'full' }, 'push', { ...env, GITHUB_EVENT_PATH: '/nonexistent/event.json' });
+    assert.ok(stub.seen.length >= 1, 'full scan made API calls');
+    assert.ok(stub.seen.every(s => s.repo === null));
   } finally { stub.server.close(); }
 });

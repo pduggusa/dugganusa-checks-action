@@ -22,13 +22,28 @@ function clean(s, max = 300) {
     .replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
-// Opaque repository marker: first 16 hex chars of sha256(lowercase owner/name). Lets the API count
-// distinct adopting repositories (and exclude our own CI) without ever receiving the name.
-// Empty/unset repository -> null -> no header.
+// Repository marker: first 16 hex chars of sha256(lowercase owner/name). Lets the API count
+// distinct adopting repositories (and exclude our own CI). Only ever computed for a repository that
+// publicRepository() has confirmed is public; empty/unset -> null -> no header.
 function repoMarker(repository) {
   const r = String(repository == null ? '' : repository).trim().toLowerCase();
   if (!r) return null;
   return crypto.createHash('sha256').update(r, 'utf8').digest('hex').slice(0, 16);
+}
+
+// The marker is a hash of a short, guessable string: anyone holding a list of repository names
+// can reverse it. So it is sent ONLY for a repository the event payload says is PUBLIC (a stable
+// key for a name that is already public). Private or internal repositories, a missing or unreadable
+// payload, or a payload naming a different repository -> null -> no header.
+function publicRepository(event, repository) {
+  const name = String(repository == null ? '' : repository).trim();
+  const r = event && typeof event === 'object' ? event.repository : null;
+  if (!name || !r || typeof r !== 'object') return null;
+  if (typeof r.full_name === 'string' && r.full_name.toLowerCase() !== name.toLowerCase()) return null;
+  if (r.private === true) return null;
+  if (r.visibility !== undefined && r.visibility !== 'public') return null; // private, internal, anything else
+  if (r.private !== false && r.visibility !== 'public') return null;          // must be positively public
+  return name;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -186,4 +201,4 @@ function normalizeDredd(d) {
   return { verdict, api_verdict: V || null, reason, evidence, signature: d.signature ? clean(d.signature, 80) : null, known_to_us: known, dep_graph_scanned: scanned };
 }
 
-module.exports = { Client, normalizePackage, normalizeDredd, clean, repoMarker, USER_AGENT, VERSION };
+module.exports = { Client, normalizePackage, normalizeDredd, clean, repoMarker, publicRepository, USER_AGENT, VERSION };
