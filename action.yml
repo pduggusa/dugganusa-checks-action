@@ -1,0 +1,74 @@
+name: DugganUSA Checks
+description: Checks new dependencies and MCP servers in pull requests for malicious packages, known vulns and unknown servers.
+author: DugganUSA LLC
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  api-key:
+    description: Optional DugganUSA API key (pass it from a secret). Sent only as an Authorization Bearer header. Keyless works at the anonymous free rate.
+    required: false
+    default: ''
+  fail-on:
+    description: Lowest verdict that fails the job. block (default) fails on BLOCK only; review also fails on REVIEW and ADVISORY; none never fails on a verdict.
+    required: false
+    default: block
+  fail-on-unknown:
+    description: Fail the job when anything could not be judged (UNKNOWN). Default false, but every UNKNOWN is still annotated and never counted as a pass.
+    required: false
+    default: 'false'
+  mode:
+    description: auto (diff on pull_request and merge_group, full scan on push, schedule and workflow_dispatch), diff, or full.
+    required: false
+    default: auto
+  base-ref:
+    description: Commit to diff against in diff mode. Defaults to the pull request base SHA.
+    required: false
+    default: ''
+  include-transitive:
+    description: Check transitive packages from lockfiles. auto = yes in diff mode (new transitives are the supply-chain risk), no on full scans (rate budget).
+    required: false
+    default: auto
+  check-mcp:
+    description: Check MCP server configs (.mcp.json, claude_desktop_config.json, .cursor/mcp.json, .vscode/mcp.json) with Dredd.
+    required: false
+    default: 'true'
+  max-lookups:
+    description: Maximum API lookups per run. Items past the cap are reported as UNKNOWN, never as passed.
+    required: false
+    default: '200'
+  rate-per-minute:
+    description: Client-side pacing for package lookups. 0 = auto (10/min keyless, 60/min keyed), matching the server caps.
+    required: false
+    default: '0'
+  max-wait-seconds:
+    description: Total time the run may spend waiting out HTTP 429 rate limits before reporting the rest as UNKNOWN.
+    required: false
+    default: '300'
+  working-directory:
+    description: Directory to scan, relative to the workspace.
+    required: false
+    default: '.'
+  api-base:
+    description: API base URL (for testing). Must be https.
+    required: false
+    default: https://analytics.dugganusa.com
+
+outputs:
+  result:
+    description: pass or fail
+  block-count:
+    description: Number of BLOCK verdicts
+  review-count:
+    description: Number of REVIEW plus ADVISORY verdicts
+  unknown-count:
+    description: Number of UNKNOWN (not judged) items
+  allow-count:
+    description: Number of ALLOW verdicts
+  report-path:
+    description: Path to a JSON report with every verdict, reason and evidence
+
+runs:
+  using: node24
+  main: src/index.js

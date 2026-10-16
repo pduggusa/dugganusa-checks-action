@@ -1,0 +1,79 @@
+#!/usr/bin/env node
+'use strict';
+// DugganUSA Checks: pre-install membrane checks for pull requests.
+
+const fs = require('fs');
+const path = require('path');
+const gha = require('./gha');
+const run = require('./run');
+
+async function main() {
+  const apiKey = gha.getInput('api-key');
+  gha.mask(apiKey);
+  const failOn = gha.getInput('fail-on', 'block').toLowerCase();
+  if (!run.FAIL_ON.includes(failOn)) throw new Error(`fail-on must be one of ${run.FAIL_ON.join(', ')}`);
+  const failOnUnknown = gha.getBool('fail-on-unknown', false);
+  const modeInput = gha.getInput('mode', 'auto').toLowerCase();
+  if (!['auto', 'diff', 'full'].includes(modeInput)) throw new Error('mode must be auto, diff or full');
+  const includeTransitive = gha.getInput('include-transitive', 'auto').toLowerCase();
+  if (!['auto', 'true', 'false'].includes(includeTransitive)) throw new Error('include-transitive must be auto, true or false');
+  const maxLookups = Math.max(0, parseInt(gha.getInput('max-lookups', '200'), 10) || 0);
+  const ratePerMin = parseInt(gha.getInput('rate-per-minute', '0'), 10) || undefined;
+  const maxWaitMs = Math.max(0, parseInt(gha.getInput('max-wait-seconds', '300'), 10) || 0) * 1000;
+  const checkMcp = gha.getBool('check-mcp', true);
+  const workdir = path.resolve(process.env.GITHUB_WORKSPACE || process.cwd(), gha.getInput('working-directory', '.'));
+  const baseInput = gha.getInput('base-ref');
+  const apiBase = gha.getInput('api-base', 'https://analytics.dugganusa.com');
+
+  const event = run.readEvent();
+  let modeInfo = run.resolveMode({ modeInput, eventName: process.env.GITHUB_EVENT_NAME, event, baseInput });
+  if (modeInfo.mode === 'diff' && !run.ensureCommit(workdir, modeInfo.base)) {
+    gha.annotate('warning', `Base commit ${modeInfo.base.slice(0, 12)} is not available (use actions/checkout with fetch-depth: 0 or 2); falling back to a full scan.`, { title: 'DugganUSA Checks' });
+    modeInfo = { mode: 'full', base: null, reason: 'base commit unavailable; scanned everything' };
+  }
+  console.log(`DugganUSA Checks: ${modeInfo.reason}`);
+
+  const { items, notes, files, texts, transitive } = run.collect({ cwd: workdir, mode: modeInfo.mode, base: modeInfo.base, includeTransitive, checkMcp });
+  console.log(`DugganUSA Checks: ${files.length} manifest/config file(s), ${items.length} item(s) to check`);
+
+  const client = new run.Client({ apiBase, apiKey, packageRatePerMin: ratePerMin, maxWaitMs, log: (m) => console.log(`  ${m}`) });
+  gha.group('Lookups');
+  const results = await run.check(items, client, { maxLookups, log: (m) => console.log(`  ${m}`) });
+  gha.endGroup();
+
+  const { counts, failed, failing } = run.decide(results, { failOn, failOnUnknown });
+
+  for (const r of results) {
+    if (r.verdict === 'ALLOW') continue;
+    const i = r.item;
+    const name = `${run.label(i)}${i.version ? '@' + i.version : ''}`;
+    const ev = (r.evidence || []).length ? ` Evidence: ${r.evidence.join(', ')}.` : '';
+    const level = failing(r.verdict) ? 'error' : 'warning';
+    const lead = r.verdict === 'UNKNOWN' ? 'UNKNOWN (not judged, NOT a pass)' : r.verdict;
+    gha.annotate(level, `${lead}: ${name}. ${String(r.reason).replace(/[.\s]+$/, "")}.${ev}`, { file: path.posix.join(gha.getInput('working-directory', '.'), i.files[0]).replace(/^\.\//, ''), line: i.line, title: `DugganUSA Checks: ${r.verdict}` });
+  }
+  for (const n of notes) if (n.level === 'warning') gha.annotate('warning', n.text, { file: n.file, title: 'DugganUSA Checks' });
+
+  const md = run.summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, keyed: !!apiKey, client, transitive });
+  if (!gha.appendSummary(md)) console.log('\n' + md);
+
+  const report = { mode: modeInfo.mode, base: modeInfo.base, failed, counts, api_calls: client.calls, rate_limited: client.rateLimited,
+    results: results.map(r => ({ verdict: r.verdict, api_verdict: r.api_verdict || null, type: r.item.kind === 'mcp' ? 'mcp' : r.item.kind === 'skip' ? 'source' : r.item.ecosystem, name: run.label(r.item), version: r.item.version || null, files: r.item.files, transitive: !!r.item.transitive, reason: r.reason, evidence: r.evidence || [], signature: r.signature || null })) };
+  const reportPath = path.join(process.env.RUNNER_TEMP || require('os').tmpdir(), 'dugganusa-checks-report.json');
+  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+  gha.setOutput('result', failed ? 'fail' : 'pass');
+  gha.setOutput('block-count', String(counts.BLOCK));
+  gha.setOutput('review-count', String(counts.REVIEW + counts.ADVISORY));
+  gha.setOutput('unknown-count', String(counts.UNKNOWN));
+  gha.setOutput('allow-count', String(counts.ALLOW));
+  gha.setOutput('report-path', reportPath);
+
+  console.log(`DugganUSA Checks: ${counts.BLOCK} block, ${counts.ADVISORY} advisory, ${counts.REVIEW} review, ${counts.UNKNOWN} unknown, ${counts.ALLOW} allow -> ${failed ? 'FAIL' : 'pass'}`);
+  if (failed) process.exitCode = 1;
+}
+
+main().catch((e) => {
+  // Our own crash is not a pass: fail loudly rather than report green on a check that never ran.
+  gha.annotate('error', `DugganUSA Checks internal error, nothing was judged: ${e && e.message ? e.message : e}`, { title: 'DugganUSA Checks' });
+  process.exitCode = 1;
+});

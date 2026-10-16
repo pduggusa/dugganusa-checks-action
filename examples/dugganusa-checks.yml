@@ -1,0 +1,36 @@
+# Copy to .github/workflows/dugganusa-checks.yml
+name: DugganUSA Checks
+
+on:
+  pull_request:
+    paths:
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/npm-shrinkwrap.json'
+      - '**/requirements*.txt'
+      - '**/pyproject.toml'
+      - '**/poetry.lock'
+      - '**/Gemfile'
+      - '**/Gemfile.lock'
+      - '**/.mcp.json'
+      - '**/claude_desktop_config.json'
+      - '**/.cursor/mcp.json'
+      - '**/.vscode/mcp.json'
+  workflow_dispatch:   # full scan on demand
+
+permissions:
+  contents: read
+
+jobs:
+  membrane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # the diff needs the PR base commit
+          persist-credentials: false
+      - uses: dugganusa/dugganusa-checks-action@v1
+        with:
+          api-key: ${{ secrets.DUGGANUSA_API_KEY }}   # optional; keyless works at the free rate
+          fail-on: block          # or: review
+          fail-on-unknown: false  # UNKNOWN is annotated either way
