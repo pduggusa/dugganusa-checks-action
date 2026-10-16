@@ -8,12 +8,17 @@
 // file as UNKNOWN. Duplicate keys and table redefinition throw, as they do in tomllib.
 
 const MAX_DEPTH = 128;
+// Every table is null-prototype, and prototype-shaped keys are refused (SyntaxError -> the file is
+// reported unknown:ambiguous). Before this, `[tool.poetry.group.__proto__.dependencies]` set an
+// object's prototype instead of creating a key, so the group's packages silently vanished.
+const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const newTable = () => Object.create(null);
 
 function parseToml(text) {
   let s = String(text);
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
   let i = 0;
-  const root = {};
+  const root = newTable();
   const explicit = new Set();   // tables defined by a [header]
   const inline = new WeakSet(); // inline tables/arrays: closed once written
   const arrayTables = new WeakSet();
@@ -124,6 +129,7 @@ function parseToml(text) {
         const r = m.exec(s); if (!r) fail('expected key');
         parts.push(r[0]); i += r[0].length;
       }
+      if (RESERVED_KEYS.has(parts[parts.length - 1])) fail(`reserved key "${parts[parts.length - 1]}" (prototype-shaped keys are refused)`);
       wsInline();
       if (s[i] === '.') { i++; continue; }
       return parts;
@@ -154,7 +160,7 @@ function parseToml(text) {
     }
     if (c === '{') {
       i++;
-      const t = {};
+      const t = newTable();
       inline.add(t);
       wsInline();
       if (s[i] === '}') { i++; return t; }
@@ -184,7 +190,7 @@ function parseToml(text) {
     let t = table;
     for (let k = 0; k < parts.length - 1; k++) {
       const p = parts[k];
-      if (!own(t, p)) { t[p] = {}; }
+      if (!own(t, p)) { t[p] = newTable(); }
       else if (!isTable(t[p]) || (inline.has(t[p]) && !inInline) || explicit.has(t[p])) fail(`key ${parts.join('.')} redefines a value`);
       t = t[p];
     }
@@ -201,7 +207,7 @@ function parseToml(text) {
     let t = root;
     for (let k = 0; k < parts.length - 1; k++) {
       const p = parts[k];
-      if (!own(t, p)) t[p] = {};
+      if (!own(t, p)) t[p] = newTable();
       let nx = t[p];
       if (Array.isArray(nx)) { if (!arrayTables.has(nx)) fail('cannot extend a static array'); nx = nx[nx.length - 1]; }
       if (!isTable(nx) || inline.has(nx)) fail(`table ${parts.join('.')} conflicts with a value`);
@@ -211,7 +217,7 @@ function parseToml(text) {
     if (isArray) {
       if (!own(t, last)) { t[last] = []; arrayTables.add(t[last]); }
       if (!Array.isArray(t[last]) || !arrayTables.has(t[last])) fail(`array table ${parts.join('.')} conflicts with a value`);
-      const nt = {};
+      const nt = newTable();
       t[last].push(nt);
       cur = nt;
     } else {
@@ -220,7 +226,7 @@ function parseToml(text) {
         if (!isTable(ex) || explicit.has(ex) || inline.has(ex)) fail(`table ${parts.join('.')} defined twice`);
         // an implicitly created table may be defined once, unless dotted keys made it
         cur = ex;
-      } else { t[last] = {}; cur = t[last]; }
+      } else { t[last] = newTable(); cur = t[last]; }
       explicit.add(cur);
     }
   }

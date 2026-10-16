@@ -18,7 +18,7 @@ test('manifestKind recognizes every supported file and ignores vendored trees', 
   assert.equal(p.manifestKind('.cursor/mcp.json'), 'mcp');
   assert.equal(p.manifestKind('.vscode/mcp.json'), 'mcp');
   assert.equal(p.manifestKind('claude_desktop_config.json'), 'mcp');
-  assert.equal(p.manifestKind('mcp.json'), null);
+  assert.equal(p.manifestKind('mcp.json'), 'mcp'); // any mcp.json is an MCP config (invariant F)
   assert.equal(p.manifestKind('node_modules/x/package.json'), null);
   assert.equal(p.manifestKind('README.md'), null);
 });
@@ -31,7 +31,8 @@ test('package.json: exact versions kept, ranges noted, git/local sources flagged
   assert.deepEqual(pkgs(m), ['npm:express@', 'npm:lodash@4.17.15', 'npm:real-pkg@1.0.0']);
   const s = skips(m);
   assert.ok(s.find(x => x.unverifiable && /evil/.test(x.spec)));
-  assert.ok(s.find(x => !x.unverifiable && /local/.test(x.spec)));
+  assert.ok(s.find(x => x.unverifiable && x.cls === 'ambiguous' && /local/.test(x.spec)), 'file: is local code: ambiguous, not a notice');
+  assert.ok(s.find(x => x.unverifiable && x.cls === 'ambiguous' && /aliased/.test(x.spec)), 'an npm: alias is reported as ambiguous too');
 });
 
 test('package-lock: v3 direct vs transitive, non-registry resolved flagged', () => {

@@ -82,7 +82,7 @@ test('pull request diff: BLOCK fails the job, REVIEW/ADVISORY warn, UNKNOWN is l
     assert.ok(!r.report.results.some(x => x.name === 'requests'), 'unchanged requirements file not scanned');
     assert.match(r.out, /::error file=package\.json,line=\d+,title=DugganUSA Checks%3A BLOCK::BLOCK: cxp-jquery@1\.0\.0/);
     assert.match(r.out, /::warning file=package\.json,line=\d+,title=DugganUSA Checks%3A REVIEW::REVIEW: lodash@4\.17\.15/);
-    assert.match(r.out, /::warning .*UNKNOWN \(not judged, NOT a pass\): mystery/);
+    assert.match(r.out, /::warning .*UNKNOWN: not in corpus \(not judged, NOT a pass\): mystery/);
     assert.match(r.summary, /Result: FAILED/);
     assert.match(r.summary, /GHSA-p6mc-m468-83gw/);
     assert.match(r.summary, /CVE-2026-19516/);

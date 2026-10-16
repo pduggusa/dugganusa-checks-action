@@ -95,11 +95,15 @@ function showAt(cwd, rev, rel) {
   } catch { return null; }
 }
 
+const MAX_WALK_DEPTH = 64;
+// -> array of repository-relative paths; out.truncated lists directories past the depth limit
+// (reported as unknown:ambiguous by collect, never silently skipped).
 function listFiles(cwd) {
   try { return git(cwd, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']).split('\0').filter(Boolean); } catch { /* not a git checkout */ }
   const out = [];
+  out.truncated = [];
   const walk = (d, rel, depth) => {
-    if (depth > 64) return;
+    if (depth > MAX_WALK_DEPTH) { out.truncated.push(rel); return; }
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       if (e.name === '.git' || e.name === 'node_modules') continue;
       const r = rel ? `${rel}/${e.name}` : e.name;
@@ -134,6 +138,7 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
   } else {
     files = listFiles(cwd);
   }
+  const truncated = files.truncated || [];
   files = files.filter(f => parsers.manifestKind(f) && (!pathFilter || pathFilter(f)));
   if (!checkMcp) files = files.filter(f => parsers.manifestKind(f) !== 'mcp');
   const transitive = includeTransitive === 'auto' ? mode === 'diff' : includeTransitive === 'true';
@@ -144,14 +149,16 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
     it.line = lineOf(text, it.kind === 'mcp' ? it.key : it.name);
     const k = it.kind === 'package' ? parsers.pkgKey(it.ecosystem, it.name, it.version) : it.kind === 'mcp' ? `mcp:${it.server}@${it.version || ''}` : `skip:${f}:${it.spec}`;
     const prev = byKey.get(k);
-    if (prev) { if (!prev.files.includes(f)) prev.files.push(f); return; }
+    // an ambiguous finding is never hidden behind an earlier, milder item with the same key
+    if (prev && !(it.kind === 'skip' && it.cls === 'ambiguous' && prev.cls !== 'ambiguous')) { if (!prev.files.includes(f)) prev.files.push(f); return; }
     byKey.set(k, it);
   };
+  for (const d of truncated) addItem(d, parsers.unknown(d, `directory nesting deeper than ${MAX_WALK_DEPTH} levels was not scanned`), '');
   for (const f of files) {
     const kind = parsers.manifestKind(f);
     let newBuf;
     try { newBuf = safeRead(cwd, f); } catch (e) {
-      addItem(f, { kind: 'skip', unverifiable: true, spec: f, reason: `file not read: ${e.message}. Installers may still read it, so nothing in it was judged`, change: 'added' }, '');
+      addItem(f, { kind: 'skip', unverifiable: true, cls: 'ambiguous', spec: f, reason: `file not read: ${e.message}. Installers may still read it, so nothing in it was judged`, change: 'added' }, '');
       continue;
     }
     let newText = '';
@@ -163,6 +170,21 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
     const { items, errors } = parsers.diffItems(kind, oldBuf, newBuf, { transitive, file: f, readInclude: readNew }, { transitive, file: f, readInclude: readOld });
     for (const e of errors) notes.push({ file: f, text: `${f} ${e}`, level: 'warning' });
     for (const it of items) addItem(f, it, newText);
+  }
+  // npx runs a package of the same name from this repository (a workspace member, or a file:/git/
+  // alias dependency installed into node_modules) instead of fetching the registry package we
+  // judge. Every package.json in the repository is read for this, changed or not.
+  const npx = [...byKey.entries()].filter(([, i]) => i.kind === 'mcp' && i.via === 'npx');
+  if (npx.length) {
+    const shadow = new Set();
+    for (const f of listFiles(cwd)) {
+      if (parsers.manifestKind(f) !== 'package.json') continue;
+      try { for (const n of parsers.localNpmNames(parsers.decode('package.json', safeRead(cwd, f)))) shadow.add(n); } catch { /* unreadable: reported elsewhere if changed */ }
+    }
+    for (const [k, i] of npx) {
+      if (!shadow.has(String(i.server).toLowerCase())) continue;
+      byKey.set(k, { ...parsers.unknown(i.key, `MCP server "${i.key}": npx package "${i.server}" has the same name as a package or non-registry dependency in this repository, so npx may run the local copy instead of the registry package`), files: i.files, line: i.line, change: i.change });
+    }
   }
   let items = [...byKey.values()];
   // A range in package.json plus the exact version from the lockfile is one package: keep the exact one.
@@ -187,25 +209,41 @@ async function check(items, client, { maxLookups, log }) {
   let used = 0;
   const results = [];
   const work = sorted.map(async (i) => {
-    if (i.kind === 'skip') return { item: i, verdict: 'UNKNOWN', reason: `not checked: ${i.reason}`, evidence: [] };
-    if (used >= maxLookups) return { item: i, verdict: 'UNKNOWN', reason: `not checked: lookup cap (max-lookups=${maxLookups}) reached`, evidence: [] };
+    if (i.kind === 'skip') return { item: i, verdict: 'UNKNOWN', unknown_class: i.cls === 'not_in_corpus' ? 'not_in_corpus' : 'ambiguous', reason: `not checked: ${i.reason}`, evidence: [] };
+    // a count limit is attacker-reachable (pad the PR), so what it cuts off is ambiguous
+    if (used >= maxLookups) return { item: i, verdict: 'UNKNOWN', unknown_class: 'ambiguous', reason: `not checked: lookup cap (max-lookups=${maxLookups}) reached`, evidence: [] };
     used++;
     const r = i.kind === 'mcp' ? await client.checkMcpServer(i) : await client.checkPackage(i);
     log(`${i.kind === 'mcp' ? 'mcp' : i.ecosystem} ${neutralize(label(i), 200)}${i.version ? '@' + neutralize(i.version, 80) : ''}: ${r.verdict}`);
-    return { item: i, ...r };
+    // a clean identity the API could not judge (no record, unavailable, rate-limited)
+    return { item: i, ...r, ...(r.verdict === 'UNKNOWN' ? { unknown_class: 'not_in_corpus' } : {}) };
   });
   // The client paces and serializes per lane, so starting them all is safe.
   for (const r of await Promise.all(work)) results.push(r);
   return results;
 }
 
-function decide(results, { failOn, failOnUnknown }) {
-  const counts = { BLOCK: 0, ADVISORY: 0, REVIEW: 0, UNKNOWN: 0, ALLOW: 0 };
-  for (const r of results) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
-  const failing = (v) => (failOn !== 'none' && v === 'BLOCK')
-    || (failOn === 'review' && (v === 'REVIEW' || v === 'ADVISORY'))
-    || (failOnUnknown && v === 'UNKNOWN');
-  const failed = results.some(r => failing(r.verdict));
+// Two classes of UNKNOWN:
+//   ambiguous      evasion-shaped (non-canonical launcher, git/url/file/alias spec, duplicate key,
+//                  Gemfile code, a limit hit, unparsed manifest...): fails unless fail-on-ambiguous is false.
+//   not_in_corpus  clean identity, nothing judged it: fails only with fail-on-unknown.
+// fail-on: none disables verdict failures, not the ambiguous gate (that has its own input).
+const unknownClass = (r) => (r.verdict === 'UNKNOWN' ? (r.unknown_class === 'not_in_corpus' ? 'not_in_corpus' : 'ambiguous') : null);
+function decide(results, { failOn, failOnUnknown, failOnAmbiguous = true }) {
+  const counts = { BLOCK: 0, ADVISORY: 0, REVIEW: 0, UNKNOWN: 0, ALLOW: 0, UNKNOWN_AMBIGUOUS: 0, UNKNOWN_NOT_IN_CORPUS: 0 };
+  for (const r of results) {
+    counts[r.verdict] = (counts[r.verdict] || 0) + 1;
+    if (r.verdict === 'UNKNOWN') counts[unknownClass(r) === 'ambiguous' ? 'UNKNOWN_AMBIGUOUS' : 'UNKNOWN_NOT_IN_CORPUS']++;
+  }
+  const failing = (r) => {
+    const v = typeof r === 'string' ? r : r.verdict;
+    if (failOn !== 'none' && v === 'BLOCK') return true;
+    if (failOn === 'review' && (v === 'REVIEW' || v === 'ADVISORY')) return true;
+    if (v !== 'UNKNOWN') return false;
+    const cls = typeof r === 'string' ? 'ambiguous' : unknownClass(r);
+    return cls === 'ambiguous' ? !!failOnAmbiguous : !!failOnUnknown;
+  };
+  const failed = results.some(r => failing(r));
   return { counts, failed, failing };
 }
 
@@ -215,18 +253,22 @@ function decide(results, { failOn, failOnUnknown }) {
 function mdCell(s) { return clean(s, 400).replace(/[\\`*_{}\[\]()#!|<>&~:@$]/g, (c) => `&#${c.charCodeAt(0)};`); }
 
 const ICON = { BLOCK: '⛔ BLOCK', ADVISORY: '⚠️ ADVISORY', REVIEW: '⚠️ REVIEW', UNKNOWN: '❔ UNKNOWN', ALLOW: '✅ ALLOW' };
+const icon = (r) => (r.verdict === 'UNKNOWN' ? (unknownClass(r) === 'ambiguous' ? '🚩 UNKNOWN: ambiguous' : '❔ UNKNOWN: not in corpus') : ICON[r.verdict]);
 
-function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, keyed, client, transitive }) {
+function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, failOnAmbiguous = true, keyed, client, transitive }) {
   const L = [];
   L.push('## DugganUSA Checks');
   L.push('');
   L.push(`**Result: ${failed ? 'FAILED' : 'passed'}** · ${mdCell(modeInfo.reason)}${modeInfo.mode === 'diff' ? (transitive ? ' (lockfile transitives included)' : '') : (transitive ? '' : ' (lockfile transitives skipped; set include-transitive: true)')}`);
   L.push('');
-  L.push(`| BLOCK | ADVISORY | REVIEW | UNKNOWN | ALLOW |`);
-  L.push(`|---:|---:|---:|---:|---:|`);
-  L.push(`| ${counts.BLOCK} | ${counts.ADVISORY} | ${counts.REVIEW} | ${counts.UNKNOWN} | ${counts.ALLOW} |`);
+  const amb = counts.UNKNOWN_AMBIGUOUS || 0; const nic = counts.UNKNOWN_NOT_IN_CORPUS || 0;
+  L.push(`| BLOCK | ADVISORY | REVIEW | UNKNOWN: ambiguous | UNKNOWN: not in corpus | ALLOW |`);
+  L.push(`|---:|---:|---:|---:|---:|---:|`);
+  L.push(`| ${counts.BLOCK} | ${counts.ADVISORY} | ${counts.REVIEW} | ${amb} | ${nic} | ${counts.ALLOW} |`);
   L.push('');
-  L.push(`Fails on: BLOCK${failOn === 'review' ? ', REVIEW, ADVISORY' : ''}${failOn === 'none' ? ' (disabled: fail-on none)' : ''}${failOnUnknown ? ', UNKNOWN' : ''}. ${counts.UNKNOWN && !failOnUnknown ? `**${counts.UNKNOWN} UNKNOWN: these were not judged and are not a pass.**` : ''}`);
+  L.push(`Fails on: BLOCK${failOn === 'review' ? ', REVIEW, ADVISORY' : ''}${failOn === 'none' ? ' (disabled: fail-on none)' : ''}${failOnAmbiguous ? ', UNKNOWN: ambiguous' : ''}${failOnUnknown ? ', UNKNOWN: not in corpus' : ''}. ${counts.UNKNOWN && (!failOnUnknown || !failOnAmbiguous) ? `**${counts.UNKNOWN} UNKNOWN: these were not judged and are not a pass.**` : ''}`);
+  L.push('');
+  L.push('**UNKNOWN: ambiguous** means the entry is evasion-shaped: this check could not prove what would be installed or run (a non-canonical MCP launcher, a git/URL/file/alias spec, a duplicate key, Gemfile code, a limit hit, an unparsed manifest). It fails by default (`fail-on-ambiguous`). **UNKNOWN: not in corpus** means the identity is clean but nothing judged it (no record, remote server, API unavailable); it fails only with `fail-on-unknown`.');
   L.push('');
   if (results.length) {
     L.push('| Verdict | Type | Name | Version | File | Reason | Evidence |');
@@ -235,7 +277,7 @@ function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, fai
     for (const r of sorted) {
       const i = r.item;
       const type = i.kind === 'mcp' ? 'MCP server' : i.kind === 'skip' ? 'source' : `${i.ecosystem}${i.transitive ? ' (transitive)' : ''}`;
-      L.push(`| ${ICON[r.verdict]} | ${type} | <code>${mdCell(label(i))}</code> | ${mdCell(i.version || '—')} | ${mdCell(i.files.join(', '))} | ${mdCell(r.reason)} | ${mdCell((r.evidence || []).join(', ') || '—')} |`);
+      L.push(`| ${icon(r)} | ${type} | <code>${mdCell(label(i))}</code> | ${mdCell(i.version || '—')} | ${mdCell(i.files.join(', '))} | ${mdCell(r.reason)} | ${mdCell((r.evidence || []).join(', ') || '—')} |`);
     }
   } else {
     L.push('No dependency manifests or MCP configs with new or changed entries.');
@@ -253,4 +295,4 @@ function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, fai
   return L.join('\n');
 }
 
-module.exports = { resolveMode, ensureCommit, collect, check, decide, summaryMarkdown, readEvent, label, safeRead, showAt, validRev, mdCell, FAIL_ON, Client };
+module.exports = { unknownClass, listFiles, resolveMode, ensureCommit, collect, check, decide, summaryMarkdown, readEvent, label, safeRead, showAt, validRev, mdCell, FAIL_ON, Client };

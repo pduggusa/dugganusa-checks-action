@@ -15,9 +15,13 @@ inputs:
     required: false
     default: block
   fail-on-unknown:
-    description: Fail the job when anything could not be judged (UNKNOWN). Default false, but every UNKNOWN is still annotated and never counted as a pass.
+    description: Fail the job on UNKNOWN of class not_in_corpus (a clean identity nothing judged - no record, remote MCP server, API unavailable). Default false, but every UNKNOWN is still annotated and never counted as a pass.
     required: false
     default: 'false'
+  fail-on-ambiguous:
+    description: Fail the job on UNKNOWN of class ambiguous (evasion-shaped - non-canonical MCP launcher, git/URL/file/tarball/alias spec, duplicate or prototype-shaped key, unresolvable override, Gemfile code, a depth/size/count limit hit, an unparsed manifest kind, a non-plain packageManager). Default true.
+    required: false
+    default: 'true'
   mode:
     description: auto (diff on pull_request and merge_group, full scan on push, schedule and workflow_dispatch), diff, or full.
     required: false
@@ -31,11 +35,11 @@ inputs:
     required: false
     default: auto
   check-mcp:
-    description: Check MCP server configs (.mcp.json, claude_desktop_config.json, .cursor/mcp.json, .vscode/mcp.json) with Dredd.
+    description: Check MCP server configs (any mcp.json or *.mcp.json, claude_desktop_config.json, .claude/settings.json, .vscode/settings.json, .gemini/settings.json, .cursor/settings.json) with Dredd.
     required: false
     default: 'true'
   max-lookups:
-    description: Maximum API lookups per run. Items past the cap are reported as UNKNOWN, never as passed.
+    description: Maximum API lookups per run. Items past the cap are reported as UNKNOWN (ambiguous, since a PR can pad itself past a cap), never as passed.
     required: false
     default: '200'
   rate-per-minute:
@@ -63,7 +67,9 @@ outputs:
   review-count:
     description: Number of REVIEW plus ADVISORY verdicts
   unknown-count:
-    description: Number of UNKNOWN (not judged) items
+    description: Number of UNKNOWN (not judged) items, both classes
+  ambiguous-count:
+    description: Number of UNKNOWN items of class ambiguous (evasion-shaped)
   allow-count:
     description: Number of ALLOW verdicts
   report-path:

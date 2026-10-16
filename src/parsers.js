@@ -8,11 +8,17 @@
 //       a registry package whose identity is exactly what the installer fetches;
 //   { kind: 'mcp', key, where, server, version|null, via }
 //       an MCP server whose identity came from the package it launches (never from its key);
-//   { kind: 'skip', spec, reason, unverifiable }
-//       unverifiable=true  -> reported as UNKNOWN (git/URL/archive/private index/unparsed);
-//       unverifiable=false -> an in-repository local path, reported as a notice.
-// Anything a parser cannot classify becomes an UNKNOWN skip. Nothing is dropped silently and
-// nothing unresolved is ever judged by a name the installer would not use.
+//   { kind: 'skip', spec, reason, unverifiable, cls }
+//       unverifiable=true  -> reported as UNKNOWN of class `cls`:
+//         'ambiguous'      evasion-shaped: the parser could not prove what gets installed or run
+//                          (duplicate keys, git/URL/file/tarball/alias specs, overrides it cannot
+//                          resolve, non-canonical MCP launchers, Gemfile code, a limit hit, an
+//                          unparsed manifest kind). FAILS by default (fail-on-ambiguous: true).
+//         'not_in_corpus'  the identity is clean but nothing judged it (remote MCP server, no record
+//                          in the corpus, API unavailable). Warning; fails only with fail-on-unknown.
+//       unverifiable=false -> a declared workspace member of this repository, reported as a notice.
+// Anything a parser cannot classify becomes an ambiguous skip. Nothing is dropped silently, no limit
+// truncates silently, and nothing unresolved is ever judged by a name the installer would not use.
 
 const path = require('path');
 const { parseJson } = require('./jsonsafe');
@@ -22,6 +28,9 @@ const EXACT_SEMVER = /^v?=?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)
 const MAX_LINE = 65536;   // longer requirement lines are refused (UNKNOWN)
 const MAX_RUBY_LINE = 4096; // Gemfile lines: bounds regex backtracking
 const MAX_INCLUDE_DEPTH = 10;
+const MAX_LOCK_DEPTH = 64;     // v1 lockfile nesting; deeper = unknown:ambiguous, never dropped
+const MAX_OVERRIDE_DEPTH = 32; // overrides/resolutions nesting; deeper = unknown:ambiguous
+const MAX_DUPLICATES = 20;     // duplicate keys listed one by one; the rest are summarized, not dropped
 
 function pep503(name) { return String(name).toLowerCase().replace(/[-_.]+/g, '-'); }
 
@@ -43,20 +52,30 @@ function manifestKind(file) {
   if (b === 'package.json') return 'package.json';
   if (b === 'package-lock.json' || b === 'npm-shrinkwrap.json') return 'package-lock';
   if (/^requirements.*\.txt$/i.test(b) || /\.requirements\.txt$/i.test(b)) return 'requirements';
+  if (/^requirements.*\.in$/i.test(b) || /\.requirements\.in$/i.test(b)) return 'unsupported'; // pip-compile input: what it resolves to is not in it
   if (b === 'pyproject.toml') return 'pyproject';
   if (b === 'poetry.lock') return 'poetry.lock';
   if (b === 'Gemfile' || b === 'gems.rb') return 'gemfile';
   if (b === 'Gemfile.lock' || b === 'gems.locked') return 'gemfile.lock';
-  if (b === '.mcp.json' || b === 'claude_desktop_config.json' || (b === 'mcp.json' && /(^|\/)\.(cursor|vscode)\/mcp\.json$/.test(f))) return 'mcp';
+  // MCP configs: any file named mcp.json or *.mcp.json (a client may be pointed at any of them),
+  // the desktop config, and the editor/agent settings files that carry an MCP server block.
+  if (b === 'mcp.json' || /\.mcp\.json$/i.test(b) || b === 'claude_desktop_config.json') return 'mcp';
   if (/(^|\/)\.claude\/settings(\.local)?\.json$/.test(f)) return 'mcp';
+  if (/(^|\/)\.(vscode|gemini|cursor)\/settings\.json$/.test(f)) return 'mcp';
   // Files that change WHAT an installer fetches but that we do not resolve: reported, never ignored.
   if (UNSUPPORTED.has(b)) return 'unsupported';
   if (INSTALL_CONFIG.has(b) || /(^|\/)\.bundle\/config$/.test(f)) return 'install-config';
   return null;
 }
 
-const unknown = (spec, reason) => ({ kind: 'skip', unverifiable: true, spec: String(spec), reason });
-const local = (spec, reason) => ({ kind: 'skip', unverifiable: false, spec: String(spec), reason });
+// Parser-level UNKNOWNs are all identity-resolution failures, so the default class is ambiguous.
+const unknown = (spec, reason) => ({ kind: 'skip', unverifiable: true, cls: 'ambiguous', spec: String(spec), reason });
+const notInCorpus = (spec, reason) => ({ kind: 'skip', unverifiable: true, cls: 'not_in_corpus', spec: String(spec), reason });
+// Code that comes from a path in this repository rather than a registry is ambiguous everywhere
+// (manifests, lockfiles, launchers): it runs at install time and no registry verdict covers it.
+const localCode = (spec, reason) => unknown(spec, `${reason}: local code, not a registry package, so no verdict covers it`);
+// Only a declared workspace member is a notice: the package manager links it by design.
+const workspace = (spec, reason) => ({ kind: 'skip', unverifiable: false, cls: 'workspace', spec: String(spec), reason });
 
 // ---------------------------------------------------------------------------
 // Decoding: read bytes the way the installer does
@@ -100,18 +119,20 @@ function npmFromRange(depName, raw, depth = 0) {
     const m = /^((?:@[^/@\s]+\/)?[^/@\s]+)(?:@(.*))?$/.exec(r.slice(4));
     if (!m) return unknown(`${name}: ${r}`, 'npm: alias that does not name a registry package');
     const p = npmFromRange(m[1], m[2] || '', depth + 1);
-    if (p.kind === 'package') p.spec = `${name}: ${r}`;
+    if (p.kind === 'package') { p.spec = `${name}: ${r}`; p.alias = name; }
     return p;
   }
-  if (/\.(tgz|tar\.gz|tar)$/i.test(r)) return unknown(`${name}: ${r}`, 'tarball: its contents are not a registry package and were not checked');
-  if (/^(file:|link:|workspace:|portal:)/i.test(r) || /^(\.{1,2}(\/|\\|$)|~[/\\]|\/)/.test(r)) {
-    if (!/^workspace:/i.test(r) && /^(\/|~|[A-Za-z]:)/.test(r.replace(/^(file|link|portal):/i, ''))) return unknown(`${name}: ${r}`, 'absolute or home-relative path outside the repository');
-    return local(`${name}: ${r}`, 'local path or workspace package');
+  const tag = (it) => { it.depName = name; return it; };
+  if (/\.(tgz|tar\.gz|tar)$/i.test(r)) return tag(unknown(`${name}: ${r}`, 'tarball: its contents are not a registry package and were not checked'));
+  if (/^workspace:/i.test(r)) return tag(workspace(`${name}: ${r}`, 'workspace package of this repository'));
+  if (/^(file:|link:|portal:)/i.test(r) || /^(\.{1,2}(\/|\\|$)|~[/\\]|\/)/.test(r)) {
+    if (/^(\/|~|[A-Za-z]:)/.test(r.replace(/^(file|link|portal):/i, ''))) return tag(unknown(`${name}: ${r}`, 'absolute or home-relative path outside the repository'));
+    return tag(localCode(`${name}: ${r}`, 'file/link/path dependency'));
   }
-  if (r.includes(':')) return unknown(`${name}: ${r}`, 'git/URL/protocol source: not checkable against a registry deny-list');
-  if (r.includes('/') || r.includes('\\')) return unknown(`${name}: ${r}`, 'GitHub shorthand or path: not checkable against a registry deny-list');
-  if (!NPM_RANGE_CHARS.test(r)) return unknown(`${name}: ${r}`, 'not a registry version range or tag');
-  if (!NPM_NAME.test(name) || name.length > 214) return unknown(name, 'not a valid npm package name');
+  if (r.includes(':')) return tag(unknown(`${name}: ${r}`, 'git/URL/protocol source: not checkable against a registry deny-list'));
+  if (r.includes('/') || r.includes('\\')) return tag(unknown(`${name}: ${r}`, 'GitHub shorthand or path: not checkable against a registry deny-list'));
+  if (!NPM_RANGE_CHARS.test(r)) return tag(unknown(`${name}: ${r}`, 'not a registry version range or tag'));
+  if (!NPM_NAME.test(name) || name.length > 214) return tag(unknown(name, 'not a valid npm package name'));
   const out = { kind: 'package', ecosystem: 'npm', name, version: null, spec: r ? `${name}@${r}` : name };
   if (EXACT_SEMVER.test(r)) out.version = r.replace(/^v?=?/, '');
   else if (r && r !== 'latest' && r !== '*') out.note = `range "${r}": no exact version, so the known-vulnerability check cannot run`;
@@ -216,7 +237,7 @@ function parsePipSpec(spec) {
     const p = s.split(';')[0].trim();
     if (PIP_ARCHIVE.test(p)) return unknown(s, 'archive file: its contents are not a registry package and were not checked');
     if (/^(\/|~|[A-Za-z]:)/.test(p) || /(^|[/\\])\.\.([/\\]|$)/.test(p)) return unknown(s, 'path outside the repository');
-    return local(s, 'local path');
+    return localCode(s, 'local path requirement');
   }
   const nm = PEP508_NAME.exec(s);
   if (!nm) return unknown(s, 'not a parseable requirement');
@@ -246,15 +267,32 @@ function itemKey(item) {
   if (item.kind === 'mcp') return `mcp:${item.where}`;
   return `skip:${item.spec}`;
 }
-function put(m, item) { if (item) m.set(itemKey(item), item); }
+// A not_in_corpus or workspace item never replaces an ambiguous one under the same key: a later
+// benign-looking entry must not downgrade an evasion-shaped finding.
+function put(m, item) {
+  if (!item) return;
+  const k = itemKey(item);
+  const prev = m.get(k);
+  if (prev && prev.kind === 'skip' && prev.cls === 'ambiguous' && !(item.kind === 'skip' && item.cls === 'ambiguous')) return;
+  m.set(k, item);
+}
 
 function duplicatesAsUnknown(m, dups, file) {
-  for (const d of dups.slice(0, 20)) put(m, unknown(`duplicate key ${d}`, `${file} defines "${d}" twice; tools that keep the first value and tools that keep the last would install different things`));
+  for (const d of dups.slice(0, MAX_DUPLICATES)) put(m, unknown(`duplicate key ${d}`, `${file} defines "${d}" twice; tools that keep the first value and tools that keep the last would install different things`));
+  if (dups.length > MAX_DUPLICATES) put(m, unknown(`${dups.length - MAX_DUPLICATES} more duplicate keys in ${file}`, `limit of ${MAX_DUPLICATES} listed duplicates reached; the rest are reported together, not dropped`));
+}
+
+// npm alias (name: npm:other@ver): installed under one name, fetched as another. The fetched
+// package is still judged, and the alias itself is reported as ambiguous.
+function putNpm(m, p) {
+  put(m, p);
+  if (p && p.kind === 'package' && p.alias) put(m, unknown(p.spec, `npm alias: installed as "${p.alias}" but fetched as "${p.name}"; tools keyed on the installed name see a different package`));
 }
 
 function npmOverrides(m, obj, label, keyToName) {
   const walk = (o, depth) => {
-    if (!o || typeof o !== 'object' || depth > 32) return;
+    if (!o || typeof o !== 'object') return;
+    if (depth > MAX_OVERRIDE_DEPTH) { put(m, unknown(`${label} nested deeper than ${MAX_OVERRIDE_DEPTH}`, 'override nesting limit reached; the deeper overrides were not resolved')); return; }
     for (const [k, v] of Object.entries(o)) {
       if (k === '.') { continue; }
       const nm = keyToName(k);
@@ -264,9 +302,9 @@ function npmOverrides(m, obj, label, keyToName) {
         const p = npmFromRange(nm, v);
         if (p.kind === 'skip') p.spec = `${label} ${k}: ${v}`;
         else p.note = `${label}${p.note ? '; ' + p.note : ''}`;
-        put(m, p);
+        putNpm(m, p);
       } else if (v && typeof v === 'object') {
-        if (typeof v['.'] === 'string' && nm && !v['.'].startsWith('$')) { const p = npmFromRange(nm, v['.']); if (p.kind === 'skip') p.spec = `${label} ${k}: ${v['.']}`; put(m, p); }
+        if (typeof v['.'] === 'string' && nm && !v['.'].startsWith('$')) { const p = npmFromRange(nm, v['.']); if (p.kind === 'skip') p.spec = `${label} ${k}: ${v['.']}`; putNpm(m, p); }
         walk(v, depth + 1);
       } else put(m, unknown(`${label} ${k}`, 'override value is not a string'));
     }
@@ -287,7 +325,15 @@ function fromPackageJson(text) {
       if (typeof spec !== 'string') { put(m, unknown(`${name}`, `${sec} value is not a string`)); continue; }
       const p = npmFromRange(name, spec);
       if (p.kind === 'skip' && !p.spec.startsWith(`${name}:`) && p.spec !== name) p.spec = `${name}: ${p.spec}`;
-      put(m, p);
+      putNpm(m, p);
+    }
+  }
+  // corepack downloads and runs whatever packageManager names. Only a plain npm/pnpm/yarn
+  // name@exact-version (optionally with corepack's +sha hash) is a registry identity.
+  if (j.packageManager !== undefined) {
+    const pm = j.packageManager;
+    if (typeof pm !== 'string' || !/^(npm|pnpm|yarn)@\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?(?:\+sha(?:1|224|256|384|512)\.[0-9a-fA-F]+)?$/.test(pm)) {
+      put(m, unknown(`packageManager: ${String(typeof pm === 'string' ? pm : JSON.stringify(pm)).slice(0, 120)}`, 'corepack fetches and runs this package manager; it is not a plain npm/pnpm/yarn name@version (it may be a URL or another package)'));
     }
   }
   // overrides / resolutions rewrite the tree: an override to git or a different package is installed.
@@ -323,7 +369,7 @@ function lockEntry(m, { name, version, resolved, transitive, where }) {
     if (typeof resolved !== 'string') { put(m, unknown(`${name}@${version}`, 'resolved is not a string')); return; }
     if (/^file:/i.test(resolved) || !/^[a-z][a-z0-9+.-]*:/i.test(resolved)) {
       if (/\.(tgz|tar\.gz|tar)$/i.test(resolved)) { put(m, unknown(`${name}@${version}`, `tarball ${resolved.slice(0, 80)}: contents were not checked`)); return; }
-      put(m, local(`${name}@${version}`, 'local path in the lockfile'));
+      put(m, localCode(`${name}@${version}`, 'local path in the lockfile'));
       return;
     }
     const id = npmRegistryIdentity(resolved);
@@ -332,14 +378,16 @@ function lockEntry(m, { name, version, resolved, transitive, where }) {
       put(m, unknown(`${name}@${version}`, `lockfile says ${vname}@${ver} but its resolved URL fetches ${id.name}@${id.version}; the fetched package is checked separately`));
     }
     put(m, { kind: 'package', ecosystem: 'npm', name: id.name, version: id.version, spec: `${id.name}@${id.version}`, transitive });
+    if (vname !== name) put(m, unknown(`${name}@${version}`, `npm alias: installed as "${name}" but fetched as "${id.name}"`));
     return;
   }
   if (!EXACT_SEMVER.test(ver)) {
-    if (/^file:/i.test(ver)) { put(m, /\.(tgz|tar\.gz|tar)$/i.test(ver) ? unknown(`${name}@${version}`, 'tarball: contents were not checked') : local(`${name}@${version}`, 'local path in the lockfile')); return; }
+    if (/^file:/i.test(ver)) { put(m, /\.(tgz|tar\.gz|tar)$/i.test(ver) ? unknown(`${name}@${version}`, 'tarball: contents were not checked') : localCode(`${name}@${version}`, 'local path in the lockfile')); return; }
     put(m, unknown(`${name}@${version}`, 'lockfile version is not a registry version (git, URL or tag): not checkable'));
     return;
   }
   put(m, { kind: 'package', ecosystem: 'npm', name: vname, version: ver.replace(/^v?=?/, ''), spec: `${vname}@${ver}`, transitive });
+  if (vname !== name) put(m, unknown(`${name}@${version}`, `npm alias: installed as "${name}" but fetched as "${vname}"`));
 }
 
 function fromPackageLock(text, { transitive = true } = {}) {
@@ -363,15 +411,16 @@ function fromPackageLock(text, { transitive = true } = {}) {
     lockEntry(m, { name: typeof info.name === 'string' ? info.name : pathName, version: info.version, resolved: info.resolved, transitive: !isDirect, where: p });
   }
   if (j.dependencies && typeof j.dependencies === 'object') {
-    const walk = (deps, depth) => {
-      if (depth > 64) return;
-      for (const [name, info] of Object.entries(deps || {})) {
+    const walk = (deps, depth, where) => {
+      if (depth > MAX_LOCK_DEPTH) { put(m, unknown(`${where} nested deeper than ${MAX_LOCK_DEPTH}`, 'lockfile nesting limit reached; the deeper entries were not read')); return; }
+      if (!deps || typeof deps !== 'object' || Array.isArray(deps)) { put(m, unknown(where, 'lockfile dependencies is not an object')); return; }
+      for (const [name, info] of Object.entries(deps)) {
         if (!info || typeof info !== 'object') { put(m, unknown(name, 'lockfile entry is not an object')); continue; }
         if (transitive || depth === 0) lockEntry(m, { name, version: info.version, resolved: info.resolved, transitive: depth > 0, where: `dependencies.${name}` });
-        if (info.dependencies) walk(info.dependencies, depth + 1);
+        if (info.dependencies) walk(info.dependencies, depth + 1, `${where}.${name}.dependencies`);
       }
     };
-    walk(j.dependencies, 0);
+    walk(j.dependencies, 0, 'dependencies');
   }
   return m;
 }
@@ -474,7 +523,7 @@ function poetryDep(m, name, v, where) {
   if (Array.isArray(v)) { for (const x of v) poetryDep(m, name, x, where); return; }
   if (isObj(v)) {
     if (v.git || v.url) { put(m, unknown(name, `${where}: Poetry ${v.git ? 'git' : 'url'} source: not checkable against a registry deny-list`)); return; }
-    if (v.path || v.file) { put(m, local(name, `${where}: Poetry path dependency`)); return; }
+    if (v.path || v.file) { put(m, localCode(name, `${where}: Poetry path dependency`)); return; }
     if (v.source) { put(m, unknown(name, `${where}: Poetry source "${String(v.source).slice(0, 40)}" (not PyPI): the name was not checked`)); return; }
     poetryDep(m, name, typeof v.version === 'string' ? v.version : '*', where);
     return;
@@ -486,6 +535,14 @@ function fromPyproject(text) {
   const t = parseToml(text);
   const m = new Map();
   const project = isObj(t.project) ? t.project : {};
+  // Dependencies declared dynamic are computed by the build backend at install time (setuptools
+  // reads them from a file, other backends run code): what gets installed is not in this file.
+  if (project.dynamic !== undefined) {
+    const dyn = Array.isArray(project.dynamic) ? project.dynamic : [project.dynamic];
+    for (const d of dyn) if (typeof d !== 'string' || /dependencies/.test(d)) put(m, unknown(`project.dynamic ${String(d).slice(0, 40)}`, 'dependencies are computed by the build backend at install time, not declared here'));
+  }
+  const tsd = isObj(t.tool) && isObj(t.tool.setuptools) ? t.tool.setuptools.dynamic : undefined;
+  if (isObj(tsd)) for (const k of Object.keys(tsd)) if (/dependencies/.test(k)) put(m, unknown(`tool.setuptools.dynamic.${k}`, 'dependencies are read from another file at build time'));
   pep508List(m, isObj(t['build-system']) ? t['build-system'].requires : null, 'build-system.requires');
   pep508List(m, project.dependencies, 'project.dependencies');
   if (isObj(project['optional-dependencies'])) for (const [g, arr] of Object.entries(project['optional-dependencies'])) pep508List(m, arr, `project.optional-dependencies.${g}`);
@@ -506,7 +563,7 @@ function fromPyproject(text) {
       for (const s of list) {
         if (!isObj(s)) { put(m, unknown(`tool.uv.sources.${n}`, 'unrecognized source')); redirected.add(pep503(n)); continue; }
         if (s.workspace === true) continue;
-        if (s.path && !s.git && !s.url && !s.index) { put(m, local(`tool.uv.sources.${n}`, 'local path source')); redirected.add(pep503(n)); continue; }
+        if (s.path && !s.git && !s.url && !s.index) { put(m, localCode(`tool.uv.sources.${n}`, 'uv path source')); redirected.add(pep503(n)); continue; }
         put(m, unknown(`tool.uv.sources.${n}`, `uv source (${s.git ? 'git' : s.url ? 'url' : s.index ? 'index ' + String(s.index).slice(0, 40) : 'unknown'}): not PyPI, so the name was not checked`));
         redirected.add(pep503(n));
       }
@@ -538,7 +595,7 @@ function fromPoetryLock(text) {
       const type = String(src.type || '');
       const url = String(src.url || '');
       if (type === 'legacy' && /^https:\/\/pypi\.org\/simple\/?$/.test(url)) { /* explicit PyPI */ }
-      else if (type === 'directory') { put(m, local(spec, 'Poetry directory source')); continue; }
+      else if (type === 'directory' || type === 'file') { put(m, localCode(spec, `Poetry ${type} source`)); continue; }
       else if (type === 'legacy') { put(m, unknown(spec, `alternate package index ${url.slice(0, 80)} (dependency-confusion surface): the name was judged on public PyPI only, so it was not checked`)); continue; }
       else { put(m, unknown(spec, `Poetry source type "${type.slice(0, 20)}": not from PyPI, the name was not checked`)); continue; }
     }
@@ -548,8 +605,13 @@ function fromPoetryLock(text) {
   return m;
 }
 
-// ---- Gemfile: Ruby source. Only a small static subset is understood; every other line is
-// code bundler would execute, so it is UNKNOWN rather than ignored.
+// ---- Gemfile: Ruby source. INVARIANT (C): only a trivial static subset is understood:
+//   blank/comment lines, `source "url"`, `ruby "x"`, `gem "name"[, "req"...][, static options]`,
+//   `group/platforms :sym[, ...] do` and `source "url" do` blocks with a matching `end`, and the
+//   static `git_source(:x) { |r| "...#{r}..." }` URL template.
+// The first line outside that subset is Ruby code bundler executes (it can redefine `gem`,
+// `source`, the block stack, anything), so from that line to the end of the file EVERY entry is
+// unknown:ambiguous. An `end` that closes nothing we opened is outside the subset.
 
 function rubyArgs(s) {
   // -> array of { t: 'str'|'sym'|'kw'|'arr'|'lit', v } or null when not statically parseable
@@ -618,31 +680,49 @@ function fromGemfile(text) {
     while ((l.endsWith(',') || l.endsWith('\\')) && k + 1 < raw.length && l.length < MAX_RUBY_LINE) l = l.replace(/\\$/, '') + ' ' + rubyStripComment(raw[++k]).trim();
     lines.push({ n, l });
   }
-  const blocks = []; // stack of { kind: 'group'|'source'|'other', ok }
+  // A non-RubyGems GLOBAL source applies to every gem in the file, including gems above it.
   let globalSource = null;
+  for (const { l } of lines) {
+    const x = l && /^source\s*\(?\s*(["'])([^"']+)\1\s*\)?$/.exec(l.trim());
+    if (x && !RUBYGEMS_SOURCE.test(x[2])) globalSource = globalSource || x[2];
+  }
+  const blocks = []; // stack of { kind: 'group'|'source', ok }
   const inForeign = () => blocks.some(b => b.kind === 'source' && !b.ok);
+  let poisoned = null; // line number of the first non-trivial Ruby line
+  const nonTrivial = (n, why) => { poisoned = n; put(m, unknown(`Gemfile:${n}`, `${why}; bundler executes it, so every entry from here to the end of the file is unknown`)); };
   for (const { n, l: rawLine } of lines) {
-    if (rawLine == null || rawLine.length > MAX_RUBY_LINE) { put(m, unknown(`Gemfile:${n}`, 'line too long')); continue; }
+    const where = `Gemfile:${n}`;
+    if (poisoned) {
+      const line = rawLine == null ? '' : rawLine.trim();
+      if (!line || line === 'end') continue;
+      const g = /^gem\s*\(?\s*(["'])([A-Za-z0-9._-]+)\1/.exec(line);
+      put(m, unknown(g ? `${where} ${g[2]}` : where, `follows Ruby code at Gemfile:${poisoned}: not statically resolvable`));
+      continue;
+    }
+    if (rawLine == null || rawLine.length > MAX_RUBY_LINE) { nonTrivial(n, `line longer than ${MAX_RUBY_LINE} characters`); continue; }
     const line = rawLine.trim();
     if (!line) continue;
-    const where = `Gemfile:${n}`;
-    if (line === 'end') { blocks.pop(); continue; }
+    if (line === 'end') {
+      if (!blocks.length) { nonTrivial(n, '"end" closes a block this check did not see opened (Ruby code)'); continue; }
+      blocks.pop();
+      continue;
+    }
     let x;
     if ((x = /^source\s*\(?\s*(["'])([^"']+)\1\s*\)?\s*(do)?$/.exec(line))) {
       const ok = RUBYGEMS_SOURCE.test(x[2]);
       if (x[3]) blocks.push({ kind: 'source', ok });
-      else { if (!ok) globalSource = x[2]; }
       if (!ok) put(m, unknown(`${where} source`, `gem source ${x[2].slice(0, 80)} is not RubyGems.org (dependency-confusion surface)`));
       continue;
     }
-    if (/^(git|path|github|gist|bitbucket)\b.*\bdo(\s*\|[^|]*\|)?$/.test(line)) { blocks.push({ kind: 'source', ok: /^path\b/.test(line) }); if (!/^path\b/.test(line)) put(m, unknown(`${where}`, 'git source block: gems inside it are not from RubyGems.org')); continue; }
-    if (/^(group|platforms?)\b[^{}]*\bdo$/.test(line)) { blocks.push({ kind: 'group' }); continue; }
-    if (/^git_source\s*\(\s*:\w+\s*\)\s*\{\s*\|\s*\w+\s*\|\s*"[^"`]*"\s*\}$/.test(line)) continue; // URL template; gems using it carry an unknown keyword
-    if (/^ruby\s*\(?\s*(["'][^"']*["']|file:\s*["'][^"']*["'])(\s*,.*)?\)?$/.test(line) && !/[`$]|system|exec|eval/.test(line)) continue;
-    if (/^gemspec\b/.test(line) && !/[`$(]|system|exec|eval/.test(line)) { put(m, local(where, 'gemspec: its runtime dependencies are checked through Gemfile.lock')); continue; }
+    if (/^(group|platforms?)\s*\(?\s*:\w+(\s*,\s*:\w+)*(\s*,\s*optional:\s*(true|false))?\s*\)?\s+do$/.test(line)) { blocks.push({ kind: 'group' }); continue; }
+    if ((x = /^git_source\s*\(\s*:\w+\s*\)\s*\{\s*\|\s*(\w+)\s*\|\s*"((?:[^"#`\\]|#\{\s*\w+\s*\})*)"\s*\}$/.exec(line))) {
+      const param = x[1];
+      if ([...x[2].matchAll(/#\{\s*(\w+)\s*\}/g)].every(i => i[1] === param)) continue; // static URL template
+    }
+    if (/^ruby\s*\(?\s*(["'][^"'#`\\]*["']|file:\s*["'][^"'#`\\]*["'])\s*\)?$/.test(line)) continue;
     if ((x = /^gem\s*(\(?)\s*(.*?)\s*(\)?)$/.exec(line)) && (x[1] === '(') === (x[3] === ')')) {
       const args = rubyArgs(x[2]);
-      if (!args || !args.length || args[0].t !== 'str') { put(m, unknown(where, 'gem line is not a static name and options: bundler evaluates it as code')); continue; }
+      if (!args || !args.length || args[0].t !== 'str') { nonTrivial(n, 'gem line is not a static name and options'); continue; }
       const name = args[0].v;
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) { put(m, unknown(where, 'not a valid gem name')); continue; }
       const reqs = []; let bad = null; let srcKw = null;
@@ -652,11 +732,11 @@ function fromGemfile(text) {
           const kw = args[a].v; const val = args[a + 1]; a++;
           if (GEM_SRC_KW.has(kw)) srcKw = srcKw || kw;
           else if (!GEM_OK_KW.has(kw)) bad = `unrecognized gem option ${kw}:`;
-          if (!val) bad = 'option without a value';
+          if (!val || val.t === 'kw') bad = 'option without a static value';
         } else bad = 'unexpected argument';
       }
-      if (bad) { put(m, unknown(`${where} ${name}`, `${bad}: not statically resolvable`)); continue; }
-      if (srcKw) { put(m, srcKw === 'path' ? local(name, 'Gemfile path source') : unknown(name, `Gemfile ${srcKw}: source: not checkable against RubyGems.org`)); continue; }
+      if (bad) { nonTrivial(n, `gem "${name}": ${bad}`); continue; }
+      if (srcKw) { put(m, srcKw === 'path' ? localCode(name, 'Gemfile path: source') : unknown(name, `Gemfile ${srcKw}: source: not checkable against RubyGems.org`)); continue; }
       if (inForeign() || globalSource) { put(m, unknown(name, `fetched from ${globalSource ? globalSource.slice(0, 80) : 'a non-RubyGems source block'}, not RubyGems.org`)); continue; }
       if (reqs.some(r => !/^(=|!=|>=|<=|>|<|~>)?\s*\d[\w.]*$/.test(r))) { put(m, unknown(`${name} ${reqs.join(', ')}`, 'unparseable version requirement')); continue; }
       const exact = reqs.length === 1 ? /^=?\s*(\d[\w.]*)$/.exec(reqs[0]) : null;
@@ -665,8 +745,9 @@ function fromGemfile(text) {
       put(m, item);
       continue;
     }
-    put(m, unknown(where, 'Gemfile line is Ruby code this check does not evaluate (bundler runs it at install time)'));
+    nonTrivial(n, /^gemspec\b/.test(line) ? 'gemspec evaluates a .gemspec file (Ruby code)' : 'Ruby code this check does not evaluate');
   }
+  if (!poisoned && blocks.length) put(m, unknown('Gemfile: unclosed block', `${blocks.length} block(s) never closed: the file is not the static shape this check reads`));
   return m;
 }
 
@@ -684,7 +765,7 @@ function fromGemfileLock(text) {
     const name = s && s[1], version = s && s[2];
     if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || !version || !/^\d[\w.]*$/.test(version)) { put(m, unknown(line.trim().slice(0, 80), 'unparseable locked gem')); continue; }
     const spec = `${name} (${version})`;
-    if (block === 'PATH') { put(m, local(spec, 'PATH gem from this repository')); continue; }
+    if (block === 'PATH') { put(m, localCode(spec, 'PATH gem from this repository')); continue; }
     if (block !== 'GEM' || !remotes.length || remotes.some(r => !RUBYGEMS_SOURCE.test(r))) {
       put(m, unknown(spec, `from ${block}${remotes.length ? ' ' + remotes.join(' ').slice(0, 80) : ''}: not RubyGems.org, the name was not checked`));
       continue;
@@ -703,91 +784,85 @@ function mcpEntries(j) {
   collect(j && j.mcpServers, 'mcpServers');
   collect(j && j.servers, 'servers');
   collect(j && j.mcp && j.mcp.servers, 'mcp.servers');
+  collect(j && j['mcp.servers'], '"mcp.servers"'); // VS Code settings also accept the flat dotted key
   if (j && isObj(j.projects)) for (const [pn, p] of Object.entries(j.projects)) collect(p && p.mcpServers, `projects.${pn}.mcpServers`);
   return out;
 }
 
-const NPX_BOOL = new Set(['-y', '--yes', '--no', '-q', '--quiet', '--no-install', '--ignore-existing', '-s', '--silent', '--prefer-offline', '--prefer-online', '--offline', '--bun', '--verbose']);
-const NPX_PKG = new Set(['-p', '--package']);
-const UVX_BOOL = new Set(['-q', '--quiet', '-v', '--verbose', '--offline', '--no-cache', '-n', '--isolated', '--refresh', '--no-progress', '--native-tls', '--prerelease=allow']);
-const UVX_SKIPVAL = new Set(['--python', '-p', '--python-preference', '--color']);
-const UVX_PKG = new Set(['--from', '--with', '-w']);
-const ENV_REDIRECT = /(^|_)(REGISTRY|INDEX_URL|INDEX|EXTRA_INDEX_URL|FIND_LINKS|DEFAULT_INDEX|MIRROR|REPLACE_REGISTRY_HOST)$|^NODE_OPTIONS$|^NPM_CONFIG_|^PIP_|^UV_(INDEX|EXTRA|FIND|DEFAULT)|^PYTHONPATH$|^LD_PRELOAD$|^DYLD_/i;
+// INVARIANT (A): an MCP launch identity is judged ONLY for these canonical forms; anything else
+// is unknown:ambiguous with the reason. No option, path, shell form or extra argument is
+// interpreted, so a new launcher flag, entrypoint, mount, wrapper or PATH trick cannot be judged
+// as the benign package next to it.
+//   command "npx"     args [-y] <pkg>[@version]
+//   command "uvx"     args <pkg>[==version|@version]
+//   command "docker"  args run [--rm] [-i] [-e NAME]... <image>[:tag|@digest]
+//                     (-e NAME passes a host variable BY NAME into the container; it cannot
+//                     change the image, entrypoint, mounts or command)
+// and the entry has no keys beyond those below, and its env sets none of the variables that
+// change which binary, package, registry or loader runs.
+const MCP_META_KEYS = ['disabled', 'autoApprove', 'alwaysAllow', 'timeout', 'description', 'trust', 'includeTools', 'excludeTools'];
+const MCP_LOCAL_KEYS = new Set(['command', 'args', 'env', 'type', ...MCP_META_KEYS]);
+const MCP_REMOTE_KEYS = new Set(['url', 'serverUrl', 'httpUrl', 'type', 'headers', ...MCP_META_KEYS]);
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// The required set (PATH, HOME, NODE_PATH, NODE_OPTIONS, npm_config_*, PIP_*, UV_*, LD_*, DYLD_*)
+// plus the families that move the same levers: interpreter/loader search paths, tool config
+// homes, TLS trust and proxies, and the docker daemon. Matched case-insensitively (Windows).
+const ENV_FORBIDDEN = /^(PATH|PATHEXT|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|XDG_[A-Z0-9_]*|TMPDIR|SHELL|COMSPEC|NODE_[A-Z0-9_]*|NPM_[A-Z0-9_]*|YARN_[A-Z0-9_]*|PNPM_[A-Z0-9_]*|COREPACK_[A-Z0-9_]*|BUN_[A-Z0-9_]*|PIP_[A-Z0-9_]*|UV_[A-Z0-9_]*|PYTHON[A-Z0-9_]*|VIRTUAL_ENV|CONDA_[A-Z0-9_]*|LD_[A-Z0-9_]*|DYLD_[A-Z0-9_]*|DOCKER_[A-Z0-9_]*|[A-Z0-9_]*_PROXY|SSL_CERT_[A-Z0-9_]*|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|GIT_[A-Z0-9_]*)$/i;
+const UVX_SPEC = /^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(?:(?:==|@)(\d[A-Za-z0-9.!+_-]*)|@latest)?$/;
+const DOCKER_IMAGE = /^[a-z0-9][a-z0-9._/:@-]*$/i;
 
-// -> { packages: [item], problem: string|null }
-function launcherPackages(cmd, args) {
-  const res = { packages: [], problem: null };
-  const fail = (p) => { res.problem = p; return res; };
-  if (['npx', 'bunx'].includes(cmd) || (['pnpm', 'yarn'].includes(cmd) && args[0] === 'dlx') || (cmd === 'npm' && (args[0] === 'exec' || args[0] === 'x'))) {
-    const rest = cmd === 'npx' || cmd === 'bunx' ? args : args.slice(1);
-    const pk = []; let positional = null;
-    for (let i = 0; i < rest.length; i++) {
-      const a = rest[i];
-      if (a === '--') { positional = rest[i + 1]; break; }
-      if (NPX_PKG.has(a)) { if (rest[i + 1] === undefined) return fail(`${a} without a value`); pk.push(rest[++i]); continue; }
-      if (a.startsWith('--package=')) { pk.push(a.slice(10)); continue; }
-      if (a === '-c' || a === '--call' || a === '--shell-mode' || a.startsWith('--call=')) return fail(`${a} runs a shell command`);
-      if (NPX_BOOL.has(a)) continue;
-      if (a.startsWith('-')) return fail(`launcher option ${a.slice(0, 40)} is not understood (it may change the registry or what runs)`);
-      positional = a; break;
-    }
-    if (!pk.length) { if (!positional) return fail('no package argument'); pk.push(positional); }
-    for (const p of pk) res.packages.push(parseNpmSpec(p));
-    return res;
-  }
-  if (cmd === 'uvx' || (cmd === 'uv' && args[0] === 'tool' && args[1] === 'run') || (cmd === 'pipx' && args[0] === 'run')) {
-    const rest = cmd === 'uvx' ? args : args.slice(2);
-    let from = null, positional = null; const extra = [];
-    for (let i = 0; i < rest.length; i++) {
-      const a = rest[i];
-      const [flag, inl] = a.startsWith('--') && a.includes('=') ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a, undefined];
-      const val = () => (inl !== undefined ? inl : rest[++i]);
-      if (UVX_PKG.has(flag) || (cmd === 'pipx' && flag === '--spec')) { const v = val(); if (v === undefined) return fail(`${flag} without a value`); if (flag === '--from' || flag === '--spec') from = v; else extra.push(...v.split(',')); continue; }
-      if (UVX_SKIPVAL.has(flag)) { if (val() === undefined) return fail(`${flag} without a value`); continue; }
-      if (UVX_BOOL.has(a)) continue;
-      if (a.startsWith('-')) return fail(`launcher option ${a.slice(0, 40)} is not understood (it may change the index or what runs)`);
-      positional = a; break;
-    }
-    const main = from || positional;
-    if (!main) return fail('no package argument');
-    for (const p of [main, ...extra]) {
-      const t = p.replace(/@latest$/, '').replace(/^([A-Za-z0-9._-]+(?:\[[^\]]*\])?)@(\d[\w.!+-]*)$/, '$1==$2');
-      res.packages.push(parsePipSpec(t) || unknown(p, 'empty package argument'));
-    }
-    return res;
-  }
-  return fail(`command "${String(cmd).slice(0, 40)}" runs local or arbitrary code; no package identity to judge`);
-}
-
-const DOCKER_BOOL = new Set(['-i', '-t', '-it', '-ti', '--rm', '-d', '--detach', '--init', '--interactive', '--tty', '--read-only', '--privileged', '-P', '--publish-all', '--no-healthcheck', '-q', '--quiet']);
-const DOCKER_VAL = new Set(['-e', '--env', '--env-file', '-v', '--volume', '--mount', '--name', '-p', '--publish', '--network', '--net', '-w', '--workdir', '-u', '--user', '--entrypoint', '--label', '-l', '--cap-add', '--cap-drop', '--memory', '-m', '--cpus', '--platform', '--pull', '--hostname', '-h', '--add-host', '--security-opt', '--tmpfs', '--ulimit', '--log-driver', '--log-opt', '--restart', '--shm-size', '--device', '--dns', '--ipc', '--pid', '--user-ns', '--userns', '--group-add', '--expose', '--stop-signal', '--health-cmd']);
-
-function dockerImage(args) {
-  if (args[0] !== 'run' && args[0] !== 'container') return { problem: `docker ${String(args[0] || '').slice(0, 20)}: not a docker run` };
-  let i = args[0] === 'container' ? (args[1] === 'run' ? 2 : -1) : 1;
-  if (i < 0) return { problem: 'not a docker run' };
-  for (; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--') { i++; break; }
-    if (!a.startsWith('-')) break;
-    if (a.startsWith('--') && a.includes('=')) continue;
-    if (DOCKER_BOOL.has(a)) continue;
-    if (DOCKER_VAL.has(a)) { i++; continue; }
-    if (/^-[eupvwlhm]./.test(a)) continue; // glued short option value, e.g. -eFOO=bar
-    return { problem: `docker option ${a.slice(0, 40)} is not understood` };
-  }
-  const img = args[i];
-  if (!img || !/^[a-z0-9][a-z0-9._/:@-]*$/i.test(img) || img.length > 255) return { problem: 'no image reference found' };
+function dockerIdentity(img) {
+  if (!img || !DOCKER_IMAGE.test(img) || img.length > 255) return null;
   const at = img.indexOf('@');
   const ref = at >= 0 ? img.slice(0, at) : img;
   const digest = at >= 0 ? img.slice(at + 1) : null;
-  const tm = /^(.*?)(?::([\w][\w.-]{0,127}))?$/.exec(ref);
+  if (digest !== null && !/^sha256:[0-9a-f]{64}$/.test(digest)) return null;
+  const tm = /^((?:[a-z0-9.-]+(?::\d+)?\/)?[a-z0-9._/-]+?)(?::([\w][\w.-]{0,127}))?$/.exec(ref);
+  if (!tm) return null;
   let repo = tm[1]; const tag = tm[2] || null;
   repo = repo.replace(/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)\//, '');
   // Docker's official MCP catalog namespace is mcp/<server>; anything else keeps its full path,
   // so "evil/github-mcp-server" is never judged as "github-mcp-server".
   const server = /^mcp\/[^/]+$/.test(repo) ? repo.slice(4) : repo;
   return { server, version: digest ? null : (tag && tag !== 'latest' ? tag : null) };
+}
+
+// -> { via, packages: [item], server, version } or { problem }
+function canonicalLaunch(command, args) {
+  const bad = (problem) => ({ problem });
+  if (command === 'npx') {
+    const rest = args[0] === '-y' ? args.slice(1) : args;
+    if (rest.length !== 1) return bad(`npx is canonical only as "npx [-y] <package>[@version]" with nothing else; got ${args.length} argument(s)`);
+    if (rest[0].startsWith('-')) return bad(`npx option ${rest[0].slice(0, 40)} is not part of the canonical form`);
+    const p = parseNpmSpec(rest[0]);
+    if (p.kind !== 'package') return bad(`npx package "${rest[0].slice(0, 80)}": ${p.reason}`);
+    if (p.alias) return bad('npx package is an npm: alias');
+    return { via: 'npx', packages: [p], server: p.name, version: p.version };
+  }
+  if (command === 'uvx') {
+    if (args.length !== 1) return bad(`uvx is canonical only as "uvx <package>[==version]" with nothing else; got ${args.length} argument(s)`);
+    const x = UVX_SPEC.exec(args[0]);
+    if (!x) return bad(`uvx argument "${args[0].slice(0, 80)}" is not a plain package name (options, --from, extras, paths and URLs are not canonical)`);
+    const p = parsePipSpec(x[2] ? `${x[1]}==${x[2]}` : x[1]);
+    if (!p || p.kind !== 'package') return bad(`uvx package "${args[0].slice(0, 80)}" did not resolve`);
+    return { via: 'uvx', packages: [p], server: p.name, version: p.version };
+  }
+  if (command === 'docker') {
+    if (args[0] !== 'run') return bad('docker is canonical only as "docker run [--rm] [-i] <image>"');
+    const seen = new Set();
+    let k = 1;
+    for (; k < args.length - 1; k++) {
+      const a = args[k];
+      if ((a === '--rm' || a === '-i') && !seen.has(a)) { seen.add(a); continue; }
+      if (a === '-e' && ENV_NAME.test(args[k + 1] || '') && k + 1 < args.length - 1) { k++; continue; }
+      return bad(`docker run argument ${a.slice(0, 40)} is not part of the canonical form (entrypoints, mounts, other flags and container commands are not judged)`);
+    }
+    if (k !== args.length - 1) return bad('docker run without an image as its last argument');
+    const id = dockerIdentity(args[k]);
+    if (!id) return bad(`"${args[k].slice(0, 80)}" is not a plain image reference`);
+    return { via: 'docker', packages: [], server: id.server, version: id.version };
+  }
+  return bad(`command "${String(command).slice(0, 60)}" is not exactly npx, uvx or docker (paths, wrappers, shells and other launchers have no package identity to judge)`);
 }
 
 function fromMcpConfig(text) {
@@ -797,38 +872,55 @@ function fromMcpConfig(text) {
   for (const [key, cfg, where] of mcpEntries(j)) {
     const say = (reason) => put(m, unknown(key, `MCP server "${key}": ${reason}`));
     if (!isObj(cfg)) { say('entry is not an object'); continue; }
-    const remote = cfg.url || cfg.serverUrl || cfg.httpUrl;
-    if (remote || ['sse', 'http', 'streamable-http'].includes(cfg.type)) {
-      let host = '';
-      try { host = new URL(String(remote)).host; } catch { host = String(remote || '').slice(0, 60); }
-      say(`remote server at ${host || 'an unspecified URL'}: no package identity to judge, and its config key is not an identity`);
+    const remoteUrl = cfg.url !== undefined ? cfg.url : cfg.serverUrl !== undefined ? cfg.serverUrl : cfg.httpUrl;
+    const isRemote = remoteUrl !== undefined || ['sse', 'http', 'streamable-http'].includes(cfg.type);
+    if (isRemote && cfg.command !== undefined) { say('has both a command and a URL: which one a client uses is client-specific'); continue; }
+    if (isRemote) {
+      const extra = Object.keys(cfg).find(k => !MCP_REMOTE_KEYS.has(k));
+      if (extra) { say(`remote entry has option "${extra.slice(0, 40)}", which is not part of the canonical form`); continue; }
+      const urls = ['url', 'serverUrl', 'httpUrl'].filter(k => cfg[k] !== undefined);
+      if (urls.length !== 1 || typeof remoteUrl !== 'string') { say('remote entry must have exactly one URL string'); continue; }
+      let host;
+      try { const u = new URL(remoteUrl); if (!/^https?:$/.test(u.protocol)) throw new Error(); host = u.host; } catch { say('remote URL does not parse'); continue; }
+      put(m, notInCorpus(key, `MCP server "${key}": remote server at ${host}; no package identity to judge, and its config key is not an identity`));
       continue;
     }
-    if (typeof cfg.command !== 'string' || !cfg.command.trim()) { say('no command'); continue; }
-    if (/\s/.test(cfg.command.trim())) { say('command contains spaces (shell-style command line): not statically resolvable'); continue; }
-    if (cfg.args != null && !Array.isArray(cfg.args)) { say('args is not an array'); continue; }
-    const args = (cfg.args || []).map(a => (typeof a === 'string' ? a : JSON.stringify(a)));
-    const env = isObj(cfg.env) ? Object.keys(cfg.env) : [];
-    const redirect = env.find(k => ENV_REDIRECT.test(k));
-    if (redirect) { say(`env ${redirect} changes where packages are fetched from or what code loads`); continue; }
-    const cmd = base(cfg.command).replace(/\.(cmd|exe|bat|ps1)$/i, '');
-    if (cmd === 'docker' || cmd === 'podman') {
-      const d = dockerImage(args);
-      if (d.problem) { say(d.problem); continue; }
-      put(m, { kind: 'mcp', key, where, server: d.server, version: d.version, via: cmd });
-      continue;
+    const extra = Object.keys(cfg).find(k => !MCP_LOCAL_KEYS.has(k));
+    if (extra) { say(`option "${extra.slice(0, 40)}" is not part of the canonical form (cwd, envFile and the like change what runs)`); continue; }
+    if (cfg.type !== undefined && cfg.type !== 'stdio') { say(`type "${String(cfg.type).slice(0, 20)}" is not stdio`); continue; }
+    if (typeof cfg.command !== 'string' || !cfg.command) { say('no command'); continue; }
+    if (cfg.args !== undefined && (!Array.isArray(cfg.args) || cfg.args.some(a => typeof a !== 'string'))) { say('args is not an array of strings'); continue; }
+    if (cfg.env !== undefined) {
+      if (!isObj(cfg.env)) { say('env is not an object'); continue; }
+      const bad = Object.keys(cfg.env).find(k => !ENV_NAME.test(k) || ENV_FORBIDDEN.test(k));
+      if (bad) { say(`env ${bad.slice(0, 40)} changes which binary, package, registry or loader runs`); continue; }
     }
-    const lp = launcherPackages(cmd, args);
-    if (lp.problem) { say(lp.problem); continue; }
-    let first = null;
-    for (const p of lp.packages) {
-      if (p.kind === 'package') { put(m, { ...p, via: `mcp:${key}` }); if (!first) first = p; }
-      else put(m, { ...p, spec: `${key}: ${p.spec}` });
-    }
-    if (first && lp.packages.every(p => p.kind === 'package')) put(m, { kind: 'mcp', key, where, server: first.name, version: first.version, via: cmd });
-    else if (!lp.packages.some(p => p.kind !== 'package')) say('no resolvable package');
+    const launch = canonicalLaunch(cfg.command, cfg.args || []);
+    if (launch.problem) { say(launch.problem); continue; }
+    for (const p of launch.packages) put(m, { ...p, via: `mcp:${key}` });
+    put(m, { kind: 'mcp', key, where, server: launch.server, version: launch.version, via: launch.via });
   }
   return m;
+}
+
+// Names npx could resolve to code in this repository instead of the registry: the "name" of every
+// package.json (workspace members are linked into node_modules) and every dependency whose spec is
+// not a plain registry range (file:, link:, git, tarball, alias...). INVARIANT for finding 8: an
+// npx MCP server whose package name is in this set is unknown:ambiguous.
+function localNpmNames(text) {
+  const names = new Set();
+  let j;
+  try { j = parseJson(text).value; } catch { return names; }
+  if (!isObj(j)) return names;
+  if (typeof j.name === 'string') names.add(j.name.toLowerCase());
+  for (const sec of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+    if (!isObj(j[sec])) continue;
+    for (const [n, spec] of Object.entries(j[sec])) {
+      const p = typeof spec === 'string' ? npmFromRange(n, spec) : null;
+      if (!p || p.kind !== 'package' || p.alias) names.add(n.toLowerCase());
+    }
+  }
+  return names;
 }
 
 // ---- Files we do not resolve, and installer config that redirects fetches.
@@ -903,4 +995,5 @@ module.exports = {
   EXACT_SEMVER, pep503, pkgKey, manifestKind, parseNpmSpec, npmFromRange, parsePipSpec, parse, diffItems, decode,
   pipLogicalLines, npmRegistryIdentity,
   fromPackageJson, fromPackageLock, fromRequirements, fromPyproject, fromPoetryLock, fromGemfile, fromGemfileLock, fromMcpConfig,
+  canonicalLaunch, localNpmNames, unknown, notInCorpus,
 };

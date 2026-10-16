@@ -43,13 +43,20 @@ A fuller example with `paths:` filters is in [`examples/dugganusa-checks.yml`](e
 | `pyproject.toml` | PyPI | PEP 621, dependency groups, Poetry tables |
 | `poetry.lock` | PyPI | every locked package |
 | `Gemfile`, `Gemfile.lock` | RubyGems | each gem; the lockfile gives exact versions |
-| `.mcp.json`, `claude_desktop_config.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.claude/settings.json` | MCP | each server; `npx`/`uvx` launchers are also checked as packages |
+| any `mcp.json` / `*.mcp.json`, `claude_desktop_config.json`, `.claude/settings.json`, `.vscode/settings.json`, `.gemini/settings.json`, `.cursor/settings.json` | MCP | each server in canonical form; `npx`/`uvx` packages are also checked as packages |
 
 **Pull requests are diff-aware.** Only entries that are new or changed against the PR base are checked, including new transitive packages in a lockfile (that is where hijacked-dependency worms land). **Push, schedule and `workflow_dispatch` run a full scan** of every manifest, direct dependencies only by default to stay inside the free rate; set `include-transitive: true` to include everything.
 
 Sources that cannot be judged by name are never silently dropped. A git URL, a tarball URL, a private index or a per-gem `source:` is reported as **UNKNOWN**, because the registry name we would check is not what your installer fetches.
 
-The parsers follow what the installer actually does, and anything they cannot classify is UNKNOWN rather than skipped: duplicate JSON keys, a lockfile entry whose `resolved` URL fetches a different package (that package is checked instead), `overrides`/`resolutions`, `-i`/`--index-url` (every package in the file becomes UNKNOWN), `-r` includes (followed inside the repository), `tool.uv.sources`, Poetry primary sources, Gemfile lines that are Ruby code rather than plain `gem` calls, and MCP servers launched by anything other than a recognized `npx`/`uvx`/`docker run` command. A remote (URL) MCP server is UNKNOWN: its config key is attacker-chosen text, not an identity. Lockfile formats we do not parse (`yarn.lock`, `pnpm-lock.yaml`, `uv.lock`, `Pipfile.lock`, ...) and installer config that redirects a registry (`.npmrc`, `pip.conf`, `uv.toml`, ...) are reported as UNKNOWN when they change.
+The parsers follow what the installer actually does, and anything they cannot classify is UNKNOWN rather than skipped. Since the second security review the rules are **invariants, not lists of bad shapes**:
+
+- **MCP launch identity is judged only for canonical forms.** `command` must be exactly `npx`, `uvx` or `docker` (no path, no `.cmd`, no wrapper), with args exactly `[-y] <pkg>[@version]` (npx), `<pkg>[==version|@version]` (uvx) or `run [--rm] [-i] [-e NAME]... <image>[:tag|@digest]` (docker), nothing after the package or image, no entry keys beyond `command`/`args`/`env`/`type: stdio` and display metadata (so `cwd`, `envFile` and friends are out), and an `env` that sets none of `PATH`, `HOME`, `NODE_*`, `NODE_PATH`, `NODE_OPTIONS`, `npm_config_*`, `PIP_*`, `UV_*`, `PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `DOCKER_*`, proxies or CA bundles. An npx package whose name matches a package or a non-registry dependency in this repository is also ambiguous (npx may run the local copy). Everything else is UNKNOWN: ambiguous, with the reason. Remote servers (`url`/`type: http|sse`) are reported by host as UNKNOWN: not in corpus.
+- **Local code is ambiguous everywhere** (`file:`/`link:`/relative-path specs, pip local paths and `-e .`, Poetry/uv path sources, `gemspec`, Gemfile.lock `PATH`). Only a declared `workspace:` member is a notice.
+- **Gemfile:** only blank/comment lines, `source "url"`, `ruby "x"`, static `gem "name", "req", key: value` lines, `group`/`platforms`/`source ... do` blocks with a matching `end`, and the static `git_source` URL template are read. From the first line outside that subset to the end of the file, every entry is UNKNOWN: ambiguous.
+- **JSON and TOML** objects are null-prototype; a `__proto__`, `constructor` or `prototype` key makes the file UNKNOWN: ambiguous.
+- **Every limit** (lockfile nesting, override nesting, duplicate-key listing, directory depth, file size, line length, include depth, `max-lookups`) reports what it cut off as UNKNOWN: ambiguous. Nothing is truncated silently.
+- **Scanned surfaces:** `package.json` (including `packageManager`: anything but a plain `npm|pnpm|yarn@x.y.z[+sha...]` is ambiguous), `package-lock.json`/`npm-shrinkwrap.json`, `requirements*.txt`, `pyproject.toml` (a `dynamic` dependency list or `tool.setuptools.dynamic` is ambiguous), `poetry.lock`, `Gemfile`/`Gemfile.lock`, and MCP configs: any `mcp.json` or `*.mcp.json`, `claude_desktop_config.json`, `.claude/settings*.json`, `.vscode/settings.json`, `.gemini/settings.json`, `.cursor/settings.json`. Formats we do not parse (`yarn.lock`, `pnpm-lock.yaml`, `uv.lock`, `Pipfile.lock`, `requirements*.in`, `setup.py`, ...) and installer config that redirects a registry (`.npmrc`, `pip.conf`, `uv.toml`, ...) are UNKNOWN: ambiguous when they change.
 
 Files are read only if they are regular files inside the workspace: symlinks, FIFOs, devices and files over 32 MB are refused and reported as UNKNOWN.
 
@@ -60,18 +67,21 @@ Files are read only if they are regular files inside the workspace: symlinks, FI
 | **BLOCK** | Known-malicious package (deny-list or reputation), or Dredd BLOCK | **Fails the job** (error annotation) |
 | **ADVISORY** | MCP server with a published CVE affecting this version | Warning |
 | **REVIEW** | Not malicious, but this version has published vulnerabilities; or a suspicious reputation; or Dredd ALLOW without a dependency scan | Warning |
-| **UNKNOWN** | Nothing was judged: server not in our catalog, unsupported source, API unreachable, rate limit, lookup cap | Warning that says **not a pass** |
+| **UNKNOWN: ambiguous** | Evasion-shaped: this check could not prove what would be installed or run (non-canonical MCP launcher, git/URL/file/tarball/alias spec, duplicate or prototype-shaped key, unresolvable override, Gemfile code, a limit hit, an unparsed manifest kind, a non-plain `packageManager`) | **Fails the job** (`fail-on-ambiguous`, default true) |
+| **UNKNOWN: not in corpus** | A clean identity nothing judged: server or package not in our catalog, remote MCP server, API unreachable, rate limit | Warning that says **not a pass** (`fail-on-unknown`, default false) |
 | **ALLOW** | No known evidence against it | Nothing |
 
 Inputs that change this:
 
 - `fail-on: review` also fails on REVIEW and ADVISORY. `fail-on: none` reports only.
-- `fail-on-unknown: true` fails when anything could not be judged.
+- `fail-on-unknown: true` also fails on UNKNOWN: not in corpus.
+- `fail-on-ambiguous: false` turns UNKNOWN: ambiguous into a warning. Do this only if you accept that a pull request can hide a BLOCK behind a git spec, a duplicate key or a wrapped launcher.
 
 ### Read this before trusting a green check
 
 - **ALLOW is not proof of safety.** It means our deny-list, the reputation signals and OSV hold nothing against that name and version today. A package published an hour ago by an attacker can look exactly like that.
-- **UNKNOWN is not a pass**, and it is counted, annotated and listed in the summary every time. The default does not fail on it, because an unknown MCP server is common and a check that is always red gets switched off. If you want the strict posture, set `fail-on-unknown: true`.
+- **UNKNOWN is not a pass**, and it is counted, annotated and listed in the summary every time, split into its two classes. An **ambiguous** UNKNOWN fails by default: before this split, a BLOCK could be turned into a passing UNKNOWN just by rewriting the dependency as a git spec or adding a duplicate key. A **not in corpus** UNKNOWN does not fail by default, because an unknown-but-clean MCP server is common and a check that is always red gets switched off. For the strict posture, set `fail-on-unknown: true`.
+- **The canonical forms are strict on purpose.** `npx -y @modelcontextprotocol/server-filesystem /some/dir` is ambiguous, because arguments after the package are handed to whatever that package runs (`npx -y tsx ./evil.ts` has the same shape). Pin the server to a canonical form, or accept the finding.
 - **A range is checked by name only.** `"express": "^4.18.0"` gets the malicious-package check but not the version vulnerability check. Commit your lockfile and the exact versions are checked.
 - No check is perfect. We cap our own confidence at 95%: something in any verdict list will be wrong, and you should treat these verdicts as one input to a decision, not a guarantee.
 
@@ -81,19 +91,20 @@ Inputs that change this:
 |---|---|---|
 | `api-key` | none | Optional DugganUSA API key. Pass it from a secret. Sent only as `Authorization: Bearer`, never in a URL, masked in logs. |
 | `fail-on` | `block` | `block`, `review` or `none` |
-| `fail-on-unknown` | `false` | Fail when anything could not be judged |
+| `fail-on-unknown` | `false` | Also fail on UNKNOWN: not in corpus |
+| `fail-on-ambiguous` | `true` | Fail on UNKNOWN: ambiguous (evasion-shaped) |
 | `mode` | `auto` | `auto` (diff on `pull_request`/`merge_group`, full otherwise), `diff`, `full` |
 | `base-ref` | PR base SHA | Commit to diff against |
 | `include-transitive` | `auto` | Lockfile transitives: yes in diff mode, no in full scans |
 | `check-mcp` | `true` | Check MCP server configs with Dredd |
-| `max-lookups` | `200` | Lookup cap per run; the rest are reported UNKNOWN |
+| `max-lookups` | `200` | Lookup cap per run; the rest are reported UNKNOWN: ambiguous |
 | `rate-per-minute` | auto | Client-side pacing for package lookups (10/min keyless, 60/min keyed) |
 | `max-wait-seconds` | `300` | Total time the run may wait out HTTP 429s |
 | `working-directory` | `.` | Directory to scan |
 
 ## Outputs
 
-`result` (`pass`/`fail`), `block-count`, `review-count` (REVIEW plus ADVISORY), `unknown-count`, `allow-count`, and `report-path`: a JSON file with every verdict, reason, evidence ID and, for Dredd, the response signature.
+`result` (`pass`/`fail`), `block-count`, `review-count` (REVIEW plus ADVISORY), `unknown-count` (both classes), `ambiguous-count`, `allow-count`, and `report-path`: a JSON file with every verdict, reason, evidence ID and, for Dredd, the response signature.
 
 ## Rate limits
 

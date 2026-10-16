@@ -9,8 +9,13 @@
 //
 // parseJson(text, { jsonc }) -> { value, duplicates: [path...], bom: bool }
 // Throws SyntaxError on anything else. Iterative depth is capped to bound the stack.
+//
+// Every object is null-prototype, and the keys "__proto__", "constructor" and "prototype" are
+// refused outright (SyntaxError, which callers report as unknown:ambiguous): a key that some
+// reader would treat as a prototype instead of data is evasion-shaped, never a dependency.
 
 const MAX_DEPTH = 256;
+const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function parseJson(text, { jsonc = false } = {}) {
   let s = String(text);
@@ -73,11 +78,12 @@ function parseJson(text, { jsonc = false } = {}) {
       const obj = Object.create(null);
       const seen = new Set();
       ws();
-      if (s[i] === '}') { i++; return toPlain(obj); }
+      if (s[i] === '}') { i++; return obj; }
       for (;;) {
         ws();
-        if (s[i] !== '"') { if (jsonc && s[i] === '}') { i++; return toPlain(obj); } fail('expected key'); }
+        if (s[i] !== '"') { if (jsonc && s[i] === '}') { i++; return obj; } fail('expected key'); }
         const k = str();
+        if (RESERVED_KEYS.has(k)) fail(`reserved key "${k}" (prototype-shaped keys are refused)`);
         const kp = pathStr ? `${pathStr}.${k}` : k;
         if (seen.has(k)) duplicates.push(kp);
         seen.add(k);
@@ -87,7 +93,7 @@ function parseJson(text, { jsonc = false } = {}) {
         obj[k] = value(kp, depth + 1); // last wins, exactly like JSON.parse; the duplicate is reported
         ws();
         if (s[i] === ',') { i++; continue; }
-        if (s[i] === '}') { i++; return toPlain(obj); }
+        if (s[i] === '}') { i++; return obj; }
         fail('expected , or }');
       }
     }
@@ -116,12 +122,6 @@ function parseJson(text, { jsonc = false } = {}) {
     fail('unexpected token');
   }
 
-  // Null-prototype while building (a "__proto__" key is data, not a prototype), plain after.
-  function toPlain(o) {
-    const p = {};
-    for (const k of Object.keys(o)) Object.defineProperty(p, k, { value: o[k], enumerable: true, writable: true, configurable: true });
-    return p;
-  }
 
   const v = value('', 0);
   ws();
