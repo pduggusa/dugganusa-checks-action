@@ -51,7 +51,7 @@ Sources that cannot be judged by name are never silently dropped. A git URL, a t
 
 The parsers follow what the installer actually does, and anything they cannot classify is UNKNOWN rather than skipped. Since the second security review the rules are **invariants, not lists of bad shapes**:
 
-- **MCP launch identity is judged only for canonical forms.** `command` must be exactly `npx`, `uvx` or `docker` (no path, no `.cmd`, no wrapper), with args exactly `[-y] <pkg>[@version]` (npx) or `<pkg>[==version|@version]` (uvx), optionally followed by plain (non-flag) arguments for the server, or `run [--rm] [-i] [-e NAME]... <image>[:tag|@digest]` (docker), nothing flag-shaped after the package and nothing at all after the image, no entry keys beyond `command`/`args`/`env`/`type: stdio` and display metadata (so `cwd`, `envFile` and friends are out), and an `env` that sets none of `PATH`, `HOME`, `NODE_*`, `NODE_PATH`, `NODE_OPTIONS`, `npm_config_*`, `PIP_*`, `UV_*`, `PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `DOCKER_*`, proxies or CA bundles. An npx server is also ambiguous when npm exec could run a local executable instead: its name or unscoped name matches the name, a dependency or a `bin` of any `package.json` in the repository, a `bin` recorded in a v2/v3 npm lockfile, or a `node_modules/.bin` entry. (v1 lockfiles carry no bin data, so there only same-named packages are caught.) Everything else is UNKNOWN: ambiguous, with the reason. Remote servers (`url`/`type: http|sse`) are reported by host as UNKNOWN: not in corpus.
+- **MCP launch identity is judged only for canonical forms.** `command` must be exactly `npx`, `uvx` or `docker` (no path, no `.cmd`, no wrapper), with args exactly `[-y] <pkg>[@version]` (npx) or `<pkg>[==version|@version]` (uvx) and nothing after the package, or `run [--rm] [-i] [-e NAME]... <image>[:tag|@digest]` (docker), nothing after the image, no entry keys beyond `command`/`args`/`env`/`type: stdio` and display metadata (so `cwd`, `envFile` and friends are out), and an `env` that sets none of `PATH`, `HOME`, `NODE_*`, `NODE_PATH`, `NODE_OPTIONS`, `npm_config_*`, `PIP_*`, `UV_*`, `PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `DOCKER_*`, proxies or CA bundles. An npx server is also ambiguous when npm exec could run a local executable instead: its name or unscoped name matches the name, a dependency or a `bin` of any `package.json` in the repository, a `bin` recorded in a v2/v3 npm lockfile, or a `node_modules/.bin` entry. (v1 lockfiles carry no bin data, so there only same-named packages are caught.) Everything else is UNKNOWN: ambiguous, with the reason. Remote servers (`url`/`type: http|sse`) are reported by host as UNKNOWN: not in corpus.
 - **Local code is ambiguous everywhere** (`file:`/`link:`/relative-path specs, pip local paths and `-e .`, Poetry/uv path sources, `gemspec`, Gemfile.lock `PATH`). Only a declared `workspace:` member is a notice.
 - **Gemfile:** only blank/comment lines, `source "url"`, `ruby "x"`, static `gem "name", "req", key: value` lines, `group`/`platforms`/`source ... do` blocks with a matching `end`, and the static `git_source` URL template are read. From the first line outside that subset to the end of the file, every entry is UNKNOWN: ambiguous.
 - **JSON and TOML** objects are null-prototype; a `__proto__`, `constructor` or `prototype` key makes the file UNKNOWN: ambiguous.
@@ -83,7 +83,19 @@ Inputs that change this:
 
 - **ALLOW is not proof of safety.** It means our deny-list, the reputation signals and OSV hold nothing against that name and version today. A package published an hour ago by an attacker can look exactly like that.
 - **UNKNOWN is not a pass**, and it is counted, annotated and listed in the summary every time, split into its three classes. An **ambiguous** UNKNOWN fails by default: before this split, a BLOCK could be turned into a passing UNKNOWN just by rewriting the dependency as a git spec or adding a duplicate key. An **unchecked** UNKNOWN (the API never answered for it) also fails by default, because padding a pull request until the rate budget or `max-lookups` runs out is the same trick. A **not in corpus** UNKNOWN does not fail by default, because an unknown-but-clean MCP server is common and a check that is always red gets switched off. For the strict posture, set `fail-on-unknown: true`.
-- **The canonical forms are strict on purpose.** `npx -y @modelcontextprotocol/server-filesystem /some/dir` is judged as the package: npx and uvx stop reading their own options at the package, so a plain argument after it cannot change which package runs. Anything flag-shaped after the package, and anything before it beyond `-y`, is ambiguous. Note what that does not cover: a plain argument is handed to whatever the package runs, so a general-purpose runner package (`npx -y tsx ./evil.ts`) is judged as the runner, not as the script it runs.
+- **The canonical forms are strict on purpose.** `npx -y @modelcontextprotocol/server-filesystem /some/dir` is ambiguous: an argument after the package is handed to whatever the package runs, and `npx -y tsx ./evil.ts` has exactly the same shape. The parser does not guess which is which. A person does, through the owner gate below.
+- **Context counts, not just the entry.** A repository `.npmrc`/`.yarnrc`/`bunfig.toml` that redirects the registry makes every npx server ambiguous; a `uv.toml`, `pip.conf` or `pyproject.toml` `[tool.uv]` index makes every uvx server ambiguous; a top-level `env` in a settings file that sets a launcher variable makes every server in that file ambiguous.
+
+### Owner gate: `allow-ambiguous`
+
+For a legitimate non-canonical MCP entry, list its fingerprint in `allow-ambiguous` (one per line; text before the fingerprint is a label for humans):
+
+```yaml
+allow-ambiguous: |
+  .mcp.json#filesystem sha256:3f1c...e9
+```
+
+Every ambiguous MCP entry prints its fingerprint in the summary's Evidence column. The fingerprint is a sha256 over the file path and the entry's canonical JSON (container path, command, args, env names and values, every option, and any top-level env), so any change to that server re-triggers the gate. A line without a fingerprint honors nothing and is annotated. A honored entry is never silent: it is listed as **ALLOWED BY OWNER (ambiguous)** with its fingerprint and counted in `owner-allowed-count`, and the package it would fetch is still checked, so a BLOCK on it still fails the job. Fingerprints that match nothing are reported as stale. Only MCP entries can be gated; manifest findings cannot.
 - **A range is checked by name only.** `"express": "^4.18.0"` gets the malicious-package check but not the version vulnerability check. Commit your lockfile and the exact versions are checked.
 - No check is perfect. We cap our own confidence at 95%: something in any verdict list will be wrong, and you should treat these verdicts as one input to a decision, not a guarantee.
 
@@ -96,6 +108,7 @@ Inputs that change this:
 | `fail-on-unknown` | `false` | Also fail on UNKNOWN: not in corpus |
 | `fail-on-ambiguous` | `true` | Fail on UNKNOWN: ambiguous (evasion-shaped) |
 | `fail-on-unchecked` | `true` | Fail on UNKNOWN: unchecked (API outage, rate limit, lookup cap) |
+| `allow-ambiguous` | none | Owner gate: fingerprints of exact ambiguous MCP entries to accept (see above) |
 | `mode` | `auto` | `auto` (diff on `pull_request`/`merge_group`, full otherwise), `diff`, `full` |
 | `base-ref` | PR base SHA | Commit to diff against |
 | `include-transitive` | `auto` | Lockfile transitives: yes in diff mode, no in full scans |
@@ -107,7 +120,7 @@ Inputs that change this:
 
 ## Outputs
 
-`result` (`pass`/`fail`), `block-count`, `review-count` (REVIEW plus ADVISORY), `unknown-count` (both classes), `ambiguous-count`, `unchecked-count`, `allow-count`, and `report-path`: a JSON file with every verdict, reason, evidence ID and, for Dredd, the response signature.
+`result` (`pass`/`fail`), `block-count`, `review-count` (REVIEW plus ADVISORY), `unknown-count` (both classes), `ambiguous-count`, `unchecked-count`, `owner-allowed-count`, `allow-count`, and `report-path`: a JSON file with every verdict, reason, evidence ID and, for Dredd, the response signature.
 
 ## Rate limits
 

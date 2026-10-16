@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const crypto = require('crypto');
 const parsers = require('./parsers');
 const { Client, clean } = require('./api');
 const { neutralize } = require('./gha');
@@ -123,7 +124,23 @@ function lineOf(text, needle) {
 }
 
 // Collect checkable items from the repo. -> { items: [...], notes: [...] }
-function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
+// Owner gate fingerprint of one MCP entry: sha256 over the file path and the canonical JSON of the
+// entry (its container path, every key and value, and any top-level env). Any change re-triggers.
+function mcpFingerprint(file, fp) { return 'sha256:' + crypto.createHash('sha256').update(`${file}\n${fp}`).digest('hex'); }
+// allow-ambiguous lines -> Set of fingerprints. A line is honored only through its fingerprint;
+// a line without one (just a name) is returned in `rejected` and never honors anything.
+function parseAllowAmbiguous(text) {
+  const allowed = new Set(); const rejected = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.replace(/#\s.*$/, '').trim();
+    if (!line) continue;
+    const m = /(?:^|\s)(sha256:[0-9a-f]{64})$/.exec(line);
+    if (m) allowed.add(m[1]); else rejected.push(line.slice(0, 120));
+  }
+  return { allowed, rejected };
+}
+
+function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter, allowAmbiguous = new Set() }) {
   const notes = [];
   let files;
   if (mode === 'diff') {
@@ -147,7 +164,9 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
   const addItem = (f, it, text) => {
     it.files = [f];
     it.line = lineOf(text, it.kind === 'mcp' ? it.key : it.name);
-    const k = it.kind === 'package' ? parsers.pkgKey(it.ecosystem, it.name, it.version) : it.kind === 'mcp' ? `mcp:${it.server}@${it.version || ''}` : `skip:${f}:${it.spec}`;
+    // MCP skips are keyed by their container path too: two entries named "fs" under different
+    // containers are two findings (else an owner-allowed one could stand in for the other).
+    const k = it.kind === 'package' ? parsers.pkgKey(it.ecosystem, it.name, it.version) : it.kind === 'mcp' ? `mcp:${it.server}@${it.version || ''}` : `skip:${f}:${it.where ? it.where + ':' : ''}${it.spec}`;
     const prev = byKey.get(k);
     // an ambiguous finding is never hidden behind an earlier, milder item with the same key
     if (prev && !(it.kind === 'skip' && it.cls === 'ambiguous' && prev.cls !== 'ambiguous')) { if (!prev.files.includes(f)) prev.files.push(f); return; }
@@ -176,7 +195,32 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
   // Every package.json and npm lockfile in the repository is read for this, changed or not, and a
   // committed node_modules/.bin entry counts too. Match on the full and the unscoped name.
   const npx = [...byKey.entries()].filter(([, i]) => i.kind === 'mcp' && i.via === 'npx');
-  if (npx.length) {
+  const uvx = [...byKey.entries()].filter(([, i]) => i.kind === 'mcp' && i.via === 'uvx');
+  // Repository context that re-points a canonical launcher without touching the MCP entry: npm
+  // reads the project .npmrc (registry=), uv reads uv.toml / pyproject [tool.uv] / pip config from
+  // the working directory. Such a file anywhere in the repository makes those launches ambiguous,
+  // changed in this PR or not.
+  const relaunch = (list, why) => { for (const [k, i] of list) byKey.set(k, { ...parsers.unknown(i.key, `MCP server "${i.key}": ${why}`), where: i.where, mcpEntry: true, fp: i.fp, files: i.files, line: i.line, change: i.change }); };
+  if (npx.length || uvx.length) {
+    const npmCfg = []; const pyCfg = [];
+    for (const f of listFiles(cwd)) {
+      const kind = parsers.manifestKind(f);
+      const b = path.posix.basename(f);
+      try {
+        if (kind === 'install-config') {
+          if (parsers.parse('install-config', parsers.decode(kind, safeRead(cwd, f)), { file: f }).size === 0) continue;
+          (/^\.(npmrc|yarnrc|yarnrc\.yml)$|^bunfig\.toml$/.test(b) ? npmCfg : pyCfg).push(f);
+        } else if (kind === 'pyproject') {
+          const t = require('./toml').parseToml(parsers.decode(kind, safeRead(cwd, f)));
+          const uvt = t.tool && t.tool.uv;
+          if (uvt && ['index', 'index-url', 'extra-index-url', 'find-links', 'no-index', 'sources'].some(x => uvt[x] !== undefined)) pyCfg.push(f);
+        }
+      } catch { if (kind === 'install-config' || kind === 'pyproject') (kind === 'pyproject' ? pyCfg : npmCfg).push(f); }
+    }
+    if (npmCfg.length) relaunch(npx.filter(([k]) => byKey.get(k).kind === 'mcp'), `npm reads ${npmCfg[0]}, which redirects where packages are fetched from, so npx may not fetch the registry package that was judged`);
+    if (pyCfg.length) relaunch(uvx, `uv reads ${pyCfg[0]}, which redirects where packages are fetched from, so uvx may not fetch the PyPI package that was judged`);
+  }
+  if (npx.some(([k]) => byKey.get(k).kind === 'mcp')) {
     const shadow = new Set();
     const binFiles = new Set();
     for (const f of listFiles(cwd)) {
@@ -190,6 +234,7 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
       } catch { /* unreadable: reported elsewhere if changed */ }
     }
     for (const [k, i] of npx) {
+      if (byKey.get(k).kind !== 'mcp') continue;
       const full = String(i.server).toLowerCase();
       const short = full.replace(/^@[^/]+\//, '');
       let why = null;
@@ -199,8 +244,20 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
       }
       if (!why && (shadow.has(full) || shadow.has(short))) why = `a package, dependency or bin named "${shadow.has(full) ? full : short}" is declared in this repository`;
       if (!why) continue;
-      byKey.set(k, { ...parsers.unknown(i.key, `MCP server "${i.key}": npx package "${i.server}" may run local code instead of the registry package (${why}; npm exec prefers a matching local executable)`), files: i.files, line: i.line, change: i.change });
+      byKey.set(k, { ...parsers.unknown(i.key, `MCP server "${i.key}": npx package "${i.server}" may run local code instead of the registry package (${why}; npm exec prefers a matching local executable)`), where: i.where, mcpEntry: true, fp: i.fp, files: i.files, line: i.line, change: i.change });
     }
+  }
+  // Owner gate: an ambiguous MCP entry is honored only when allow-ambiguous carries the
+  // fingerprint of exactly this entry as it stands now. Honored entries stay listed (never
+  // silently passed) and the package the entry would fetch, when there is one, is still checked.
+  const honored = new Set();
+  for (const i of [...byKey.values()]) {
+    if (!(i.kind === 'skip' && i.mcpEntry && i.fp != null)) continue;
+    i.fingerprint = mcpFingerprint(i.files[0], i.fp);
+    if (!allowAmbiguous.has(i.fingerprint)) continue;
+    i.owner_allowed = true;
+    honored.add(i.fingerprint);
+    if (i.candidate) addItem(i.files[0], { ...i.candidate, change: i.change }, texts[i.files[0]] || '');
   }
   let items = [...byKey.values()];
   // A range in package.json plus the exact version from the lockfile is one package: keep the exact one.
@@ -209,6 +266,7 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter }) {
   // Non-checkable local sources (path/workspace) are notes; unverifiable remote sources are UNKNOWN rows.
   for (const i of items.filter(x => x.kind === 'skip' && !x.unverifiable)) notes.push({ file: i.files[0], text: `${i.files[0]}: ${i.spec}: ${i.reason}; not checked`, level: 'notice' });
   items = items.filter(i => !(i.kind === 'skip' && !i.unverifiable));
+  for (const fpr of allowAmbiguous) if (!honored.has(fpr)) notes.push({ file: '', text: `allow-ambiguous entry ${fpr} matches no current MCP entry (the entry changed or was removed); it honors nothing`, level: 'warning' });
   return { items, notes, files, texts, transitive };
 }
 
@@ -225,7 +283,7 @@ async function check(items, client, { maxLookups, log }) {
   let used = 0;
   const results = [];
   const work = sorted.map(async (i) => {
-    if (i.kind === 'skip') return { item: i, verdict: 'UNKNOWN', unknown_class: i.cls === 'not_in_corpus' ? 'not_in_corpus' : 'ambiguous', reason: `not checked: ${i.reason}`, evidence: [] };
+    if (i.kind === 'skip') return { item: i, verdict: 'UNKNOWN', unknown_class: i.cls === 'not_in_corpus' ? 'not_in_corpus' : 'ambiguous', owner_allowed: i.owner_allowed ? i.fingerprint : null, reason: `not checked: ${i.reason}`, evidence: i.fingerprint ? [i.fingerprint] : [] };
     // a count limit is attacker-reachable (pad the PR), so what it cuts off fails by default (unchecked)
     if (used >= maxLookups) return { item: i, verdict: 'UNKNOWN', unknown_class: 'unchecked', reason: `not checked: lookup cap (max-lookups=${maxLookups}) reached`, evidence: [] };
     used++;
@@ -251,16 +309,18 @@ async function check(items, client, { maxLookups, log }) {
 const unknownClass = (r) => (r.verdict === 'UNKNOWN' ? (['not_in_corpus', 'unchecked'].includes(r.unknown_class) ? r.unknown_class : 'ambiguous') : null);
 const CLASS_COUNT = { ambiguous: 'UNKNOWN_AMBIGUOUS', unchecked: 'UNKNOWN_UNCHECKED', not_in_corpus: 'UNKNOWN_NOT_IN_CORPUS' };
 function decide(results, { failOn, failOnUnknown, failOnAmbiguous = true, failOnUnchecked = true }) {
-  const counts = { BLOCK: 0, ADVISORY: 0, REVIEW: 0, UNKNOWN: 0, ALLOW: 0, UNKNOWN_AMBIGUOUS: 0, UNKNOWN_UNCHECKED: 0, UNKNOWN_NOT_IN_CORPUS: 0 };
+  const counts = { BLOCK: 0, ADVISORY: 0, REVIEW: 0, UNKNOWN: 0, ALLOW: 0, UNKNOWN_AMBIGUOUS: 0, UNKNOWN_UNCHECKED: 0, UNKNOWN_NOT_IN_CORPUS: 0, OWNER_ALLOWED: 0 };
   for (const r of results) {
     counts[r.verdict] = (counts[r.verdict] || 0) + 1;
     if (r.verdict === 'UNKNOWN') counts[CLASS_COUNT[unknownClass(r)]]++;
+    if (r.owner_allowed) counts.OWNER_ALLOWED++;
   }
   const failing = (r) => {
     const v = typeof r === 'string' ? r : r.verdict;
     if (failOn !== 'none' && v === 'BLOCK') return true;
     if (failOn === 'review' && (v === 'REVIEW' || v === 'ADVISORY')) return true;
     if (v !== 'UNKNOWN') return false;
+    if (typeof r !== 'string' && r.owner_allowed && unknownClass(r) === 'ambiguous') return false; // honored by the owner gate, still listed
     const cls = typeof r === 'string' ? 'ambiguous' : unknownClass(r);
     return cls === 'ambiguous' ? !!failOnAmbiguous : cls === 'unchecked' ? !!failOnUnchecked : !!failOnUnknown;
   };
@@ -275,7 +335,7 @@ function mdCell(s) { return clean(s, 400).replace(/[\\`*_{}\[\]()#!|<>&~:@$]/g, 
 
 const ICON = { BLOCK: '⛔ BLOCK', ADVISORY: '⚠️ ADVISORY', REVIEW: '⚠️ REVIEW', UNKNOWN: '❔ UNKNOWN', ALLOW: '✅ ALLOW' };
 const CLASS_LABEL = { ambiguous: '🚩 UNKNOWN: ambiguous', unchecked: '⏳ UNKNOWN: unchecked', not_in_corpus: '❔ UNKNOWN: not in corpus' };
-const icon = (r) => (r.verdict === 'UNKNOWN' ? CLASS_LABEL[unknownClass(r)] : ICON[r.verdict]);
+const icon = (r) => (r.owner_allowed ? '✋ ALLOWED BY OWNER (ambiguous)' : r.verdict === 'UNKNOWN' ? CLASS_LABEL[unknownClass(r)] : ICON[r.verdict]);
 
 function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, failOnAmbiguous = true, failOnUnchecked = true, keyed, client, transitive }) {
   const L = [];
@@ -289,6 +349,8 @@ function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, fai
   L.push(`| ${counts.BLOCK} | ${counts.ADVISORY} | ${counts.REVIEW} | ${amb} | ${unc} | ${nic} | ${counts.ALLOW} |`);
   L.push('');
   L.push(`Fails on: BLOCK${failOn === 'review' ? ', REVIEW, ADVISORY' : ''}${failOn === 'none' ? ' (disabled: fail-on none)' : ''}${failOnAmbiguous ? ', UNKNOWN: ambiguous' : ''}${failOnUnchecked ? ', UNKNOWN: unchecked' : ''}${failOnUnknown ? ', UNKNOWN: not in corpus' : ''}. ${counts.UNKNOWN && (!failOnUnknown || !failOnAmbiguous || !failOnUnchecked) ? `**${counts.UNKNOWN} UNKNOWN: these were not judged and are not a pass.**` : ''}`);
+  L.push('');
+  if (counts.OWNER_ALLOWED) L.push(`**${counts.OWNER_ALLOWED} ambiguous MCP entr${counts.OWNER_ALLOWED === 1 ? 'y' : 'ies'} ALLOWED BY OWNER** through \`allow-ambiguous\` (fingerprint in the Evidence column). Any change to the entry changes its fingerprint and re-triggers the gate.`);
   L.push('');
   L.push('**UNKNOWN: ambiguous** means the entry is evasion-shaped: this check could not prove what would be installed or run (a non-canonical MCP launcher, a git/URL/file/alias spec, a duplicate key, Gemfile code, a parser limit hit, an unparsed manifest). It fails by default (`fail-on-ambiguous`). **UNKNOWN: unchecked** means the identity is clean but the API never judged it (unreachable, 5xx, timeout, rate limit past the wait budget, lookup cap); a pull request can pad itself to cause this, so it fails by default (`fail-on-unchecked`). **UNKNOWN: not in corpus** means the API answered and holds no record (or a remote MCP server); it fails only with `fail-on-unknown`.');
   L.push('');
@@ -317,4 +379,4 @@ function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, fai
   return L.join('\n');
 }
 
-module.exports = { unknownClass, listFiles, resolveMode, ensureCommit, collect, check, decide, summaryMarkdown, readEvent, label, safeRead, showAt, validRev, mdCell, FAIL_ON, Client };
+module.exports = { mcpFingerprint, parseAllowAmbiguous, unknownClass, listFiles, resolveMode, ensureCommit, collect, check, decide, summaryMarkdown, readEvent, label, safeRead, showAt, validRev, mdCell, FAIL_ON, Client };

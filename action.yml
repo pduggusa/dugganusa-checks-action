@@ -22,6 +22,10 @@ inputs:
     description: Fail the job on UNKNOWN of class unchecked (a clean identity the API never judged - unreachable, 5xx, timeout, HTTP 429 past the wait budget, max-lookups cap). A pull request can pad itself to exhaust a rate budget or cap, so this defaults to true.
     required: false
     default: 'true'
+  allow-ambiguous:
+    description: Owner gate. Newline list of sha256 fingerprints (optionally prefixed by a label such as ".mcp.json#filesystem") of exact ambiguous MCP entries to accept. Honored only when the fingerprint matches the entry as it stands (any change to command, args, env or options re-triggers). Honored entries are listed as ALLOWED BY OWNER, and the package they fetch is still checked.
+    required: false
+    default: ''
   fail-on-ambiguous:
     description: Fail the job on UNKNOWN of class ambiguous (evasion-shaped - non-canonical MCP launcher, git/URL/file/tarball/alias spec, duplicate or prototype-shaped key, unresolvable override, Gemfile code, a depth/size/count limit hit, an unparsed manifest kind, a non-plain packageManager). Default true.
     required: false
@@ -74,6 +78,8 @@ outputs:
     description: Number of UNKNOWN (not judged) items, both classes
   ambiguous-count:
     description: Number of UNKNOWN items of class ambiguous (evasion-shaped)
+  owner-allowed-count:
+    description: Number of ambiguous MCP entries accepted through allow-ambiguous
   unchecked-count:
     description: Number of UNKNOWN items of class unchecked (API never judged them)
   allow-count:

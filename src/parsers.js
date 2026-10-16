@@ -265,7 +265,7 @@ function parsePipSpec(spec) {
 function itemKey(item) {
   if (item.kind === 'package') return pkgKey(item.ecosystem, item.name, item.version);
   if (item.kind === 'mcp') return `mcp:${item.where}`;
-  return `skip:${item.spec}`;
+  return item.where ? `skip:${item.where}:${item.spec}` : `skip:${item.spec}`;
 }
 // A not_in_corpus or workspace item never replaces an ambiguous one under the same key: a later
 // benign-looking entry must not downgrade an evasion-shaped finding.
@@ -793,11 +793,11 @@ function mcpEntries(j) {
 // is unknown:ambiguous with the reason. No option, path, shell form or extra argument is
 // interpreted, so a new launcher flag, entrypoint, mount, wrapper or PATH trick cannot be judged
 // as the benign package next to it.
-//   command "npx"     args [-y] <pkg>[@version] [plain-arg]...
-//   command "uvx"     args <pkg>[==version|@version] [plain-arg]...
-//                     (npx and uvx stop parsing their own options at the package, so a trailing
-//                     argument that is not flag-shaped goes to the server and cannot change which
-//                     package runs; any arg starting with "-" after the package is ambiguous)
+//   command "npx"     args [-y] <pkg>[@version]                 (nothing after the package)
+//   command "uvx"     args <pkg>[==version|@version]           (nothing after the package)
+//                     A plain argument after the package is handed to whatever the package runs
+//                     (npx -y tsx ./evil.ts), so it is ambiguous; legitimate cases such as
+//                     server-filesystem with a path go through the owner gate (allow-ambiguous).
 //   command "docker"  args run [--rm] [-i] [-e NAME]... <image>[:tag|@digest]
 //                     (-e NAME passes a host variable BY NAME into the container; it cannot
 //                     change the image, entrypoint, mounts or command)
@@ -810,7 +810,10 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // The required set (PATH, HOME, NODE_PATH, NODE_OPTIONS, npm_config_*, PIP_*, UV_*, LD_*, DYLD_*)
 // plus the families that move the same levers: interpreter/loader search paths, tool config
 // homes, TLS trust and proxies, and the docker daemon. Matched case-insensitively (Windows).
-const ENV_FORBIDDEN = /^(PATH|PATHEXT|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|XDG_[A-Z0-9_]*|TMPDIR|SHELL|COMSPEC|NODE_[A-Z0-9_]*|NPM_[A-Z0-9_]*|YARN_[A-Z0-9_]*|PNPM_[A-Z0-9_]*|COREPACK_[A-Z0-9_]*|BUN_[A-Z0-9_]*|PIP_[A-Z0-9_]*|UV_[A-Z0-9_]*|PYTHON[A-Z0-9_]*|VIRTUAL_ENV|CONDA_[A-Z0-9_]*|LD_[A-Z0-9_]*|DYLD_[A-Z0-9_]*|DOCKER_[A-Z0-9_]*|[A-Z0-9_]*_PROXY|SSL_CERT_[A-Z0-9_]*|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|GIT_[A-Z0-9_]*)$/i;
+const ENV_FORBIDDEN = /^(PATH|PATHEXT|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|XDG_[A-Z0-9_]*|TMPDIR|SHELL|COMSPEC|NODE_[A-Z0-9_]*|NPM_[A-Z0-9_]*|YARN_[A-Z0-9_]*|PNPM_[A-Z0-9_]*|COREPACK_[A-Z0-9_]*|BUN_[A-Z0-9_]*|PIP_[A-Z0-9_]*|UV_[A-Z0-9_]*|PYTHON[A-Z0-9_]*|VIRTUAL_ENV|CONDA_[A-Z0-9_]*|LD_[A-Z0-9_]*|DYLD_[A-Z0-9_]*|DOCKER_[A-Z0-9_]*|[A-Z0-9_]*_PROXY|SSL_CERT_[A-Z0-9_]*|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|GIT_[A-Z0-9_]*|HOMEDRIVE|HOMEPATH|PREFIX|BASH_ENV|ENV|ZDOTDIR|IFS|SHELLOPTS|BASHOPTS|PS4|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|GCONV_PATH)$|(^|_)(REGISTRY|REGISTRY_SERVER|INDEX|INDEX_URL|EXTRA_INDEX_URL|FIND_LINKS|DEFAULT_INDEX|MIRROR|REPLACE_REGISTRY_HOST)$/i;
+// (The second alternative restores 4ace3af's generic registry/index/mirror rule, dropped in 2f21848:
+// a launcher-agnostic name like FOO_REGISTRY or *_INDEX_URL was refused before and must stay refused.
+// BASH_ENV/ENV/ZDOTDIR: npm exec runs bins through a shell, which sources these files first.)
 const UVX_SPEC = /^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(?:(?:==|@)(\d[A-Za-z0-9.!+_-]*)|@latest)?$/;
 const DOCKER_IMAGE = /^[a-z0-9][a-z0-9._/:@-]*$/i;
 
@@ -830,31 +833,21 @@ function dockerIdentity(img) {
   return { server, version: digest ? null : (tag && tag !== 'latest' ? tag : null) };
 }
 
-// Arguments after the package: plain values only. Flag-shaped ones are ambiguous because the
-// launcher-level meaning of a flag after the package is launcher- and version-specific.
-function trailingProblem(tail) {
-  const f = tail.find(a => a.startsWith('-'));
-  return f ? `argument ${f.slice(0, 40)} after the package is flag-shaped; only plain arguments may follow the package` : null;
-}
-
 // -> { via, packages: [item], server, version } or { problem }
 function canonicalLaunch(command, args) {
   const bad = (problem) => ({ problem });
   if (command === 'npx') {
     const rest = args[0] === '-y' ? args.slice(1) : args;
     if (!rest.length) return bad('npx without a package argument');
-    if (rest[0].startsWith('-')) return bad(`npx option ${rest[0].slice(0, 40)} is not part of the canonical form "npx [-y] <package>[@version] [plain args]"`);
-    const tail = trailingProblem(rest.slice(1));
-    if (tail) return bad(`npx ${tail}`);
+    if (rest[0].startsWith('-')) return bad(`npx option ${rest[0].slice(0, 40)} is not part of the canonical form "npx [-y] <package>[@version]"`);
+    if (rest.length !== 1) return bad(`npx is canonical only as "npx [-y] <package>[@version]" with nothing after the package; got ${rest.length - 1} more argument(s)`);
     const p = parseNpmSpec(rest[0]);
     if (p.kind !== 'package') return bad(`npx package "${rest[0].slice(0, 80)}": ${p.reason}`);
     if (p.alias) return bad('npx package is an npm: alias');
     return { via: 'npx', packages: [p], server: p.name, version: p.version };
   }
   if (command === 'uvx') {
-    if (!args.length) return bad('uvx without a package argument');
-    const tail = trailingProblem(args.slice(1));
-    if (tail) return bad(`uvx ${tail}`);
+    if (args.length !== 1) return bad(`uvx is canonical only as "uvx <package>[==version]" with nothing else; got ${args.length} argument(s)`);
     const x = UVX_SPEC.exec(args[0]);
     if (!x) return bad(`uvx argument "${args[0].slice(0, 80)}" is not a plain package name (options, --from, extras, paths and URLs are not canonical)`);
     const p = parsePipSpec(x[2] ? `${x[1]}==${x[2]}` : x[1]);
@@ -879,12 +872,31 @@ function canonicalLaunch(command, args) {
   return bad(`command "${String(command).slice(0, 60)}" is not exactly npx, uvx or docker (paths, wrappers, shells and other launchers have no package identity to judge)`);
 }
 
+// Canonical JSON (sorted keys, no whitespace) of an MCP entry: the material of the owner-gate
+// fingerprint, so ANY change to the entry (command, args, env names or values, any option)
+// changes the fingerprint and re-triggers the gate.
+function canonicalJson(v) {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  if (v && typeof v === 'object') return `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`;
+  return JSON.stringify(v === undefined ? null : v);
+}
+
 function fromMcpConfig(text) {
   const m = new Map();
   const { value: j, duplicates } = parseJson(text, { jsonc: true });
   duplicatesAsUnknown(m, duplicates, 'the MCP config');
+  // Context that re-points every launcher in the file: a top-level "env" (Claude Code settings
+  // apply it to every MCP server and tool it starts). The entry allowlist alone cannot see it.
+  let fileEnvBad = null;
+  if (isObj(j) && j.env !== undefined) {
+    if (!isObj(j.env)) fileEnvBad = 'top-level env is not an object';
+    else { const b = Object.keys(j.env).find(k => !ENV_NAME.test(k) || ENV_FORBIDDEN.test(k)); if (b) fileEnvBad = `top-level env ${b.slice(0, 40)} applies to every server in this file and changes which binary, package, registry or loader runs`; }
+    if (fileEnvBad) put(m, unknown('env', fileEnvBad));
+  }
   for (const [key, cfg, where] of mcpEntries(j)) {
-    const say = (reason) => put(m, unknown(key, `MCP server "${key}": ${reason}`));
+    const fp = canonicalJson({ where, entry: cfg, fileEnv: isObj(j) && j.env !== undefined ? j.env : null });
+    let candidate = null;
+    const say = (reason) => put(m, { ...unknown(key, `MCP server "${key}": ${reason}`), where, mcpEntry: true, fp, ...(candidate ? { candidate } : {}) });
     if (!isObj(cfg)) { say('entry is not an object'); continue; }
     const remoteUrl = cfg.url !== undefined ? cfg.url : cfg.serverUrl !== undefined ? cfg.serverUrl : cfg.httpUrl;
     const isRemote = remoteUrl !== undefined || ['sse', 'http', 'streamable-http'].includes(cfg.type);
@@ -909,10 +921,18 @@ function fromMcpConfig(text) {
       const bad = Object.keys(cfg.env).find(k => !ENV_NAME.test(k) || ENV_FORBIDDEN.test(k));
       if (bad) { say(`env ${bad.slice(0, 40)} changes which binary, package, registry or loader runs`); continue; }
     }
-    const launch = canonicalLaunch(cfg.command, cfg.args || []);
+    const args = cfg.args || [];
+    // The package a non-canonical npx/uvx line would most likely fetch: checked only if the owner
+    // gate honors this exact entry, so a BLOCK on it still fails the job.
+    if (cfg.command === 'npx' || cfg.command === 'uvx') {
+      const pre = cfg.command === 'npx' ? (args[0] === '-y' ? args.slice(1) : args) : args;
+      if (pre.length > 1 && !pre[0].startsWith('-')) { const c = canonicalLaunch(cfg.command, [pre[0]]); if (!c.problem && c.packages[0]) candidate = { ...c.packages[0], via: `mcp:${key}` }; }
+    }
+    if (fileEnvBad) { say('the file sets a top-level env that re-points launchers'); continue; }
+    const launch = canonicalLaunch(cfg.command, args);
     if (launch.problem) { say(launch.problem); continue; }
     for (const p of launch.packages) put(m, { ...p, via: `mcp:${key}` });
-    put(m, { kind: 'mcp', key, where, server: launch.server, version: launch.version, via: launch.via });
+    put(m, { kind: 'mcp', key, where, server: launch.server, version: launch.version, via: launch.via, fp });
   }
   return m;
 }

@@ -15,6 +15,8 @@ async function main() {
   const failOnUnknown = gha.getBool('fail-on-unknown', false);
   const failOnAmbiguous = gha.getBool('fail-on-ambiguous', true);
   const failOnUnchecked = gha.getBool('fail-on-unchecked', true);
+  const { allowed: allowAmbiguous, rejected: allowRejected } = run.parseAllowAmbiguous(gha.getInput('allow-ambiguous', ''));
+  for (const l of allowRejected) gha.annotate('warning', `allow-ambiguous line has no sha256 fingerprint and honors nothing: ${l}`, { title: 'DugganUSA Checks' });
   const modeInput = gha.getInput('mode', 'auto').toLowerCase();
   if (!['auto', 'diff', 'full'].includes(modeInput)) throw new Error('mode must be auto, diff or full');
   const includeTransitive = gha.getInput('include-transitive', 'auto').toLowerCase();
@@ -39,7 +41,7 @@ async function main() {
   }
   gha.log(`DugganUSA Checks: ${modeInfo.reason}`);
 
-  const { items, notes, files, texts, transitive } = run.collect({ cwd: workdir, mode: modeInfo.mode, base: modeInfo.base, includeTransitive, checkMcp });
+  const { items, notes, files, texts, transitive } = run.collect({ cwd: workdir, mode: modeInfo.mode, base: modeInfo.base, includeTransitive, checkMcp, allowAmbiguous });
   gha.log(`DugganUSA Checks: ${files.length} manifest/config file(s), ${items.length} item(s) to check`);
 
   const client = new run.Client({ apiBase, apiKey, packageRatePerMin: ratePerMin, maxWaitMs, log: (m) => gha.log(`  ${m}`) });
@@ -51,6 +53,7 @@ async function main() {
 
   for (const r of results) {
     if (r.verdict === 'ALLOW') continue;
+    if (r.owner_allowed) { gha.annotate('notice', `ALLOWED BY OWNER (ambiguous): ${run.label(r.item)}. ${String(r.reason).replace(/[.\s]+$/, '')}. Fingerprint ${r.owner_allowed}.`, { file: annFile(r.item.files[0]), line: r.item.line, title: 'DugganUSA Checks: ALLOWED BY OWNER' }); continue; }
     const i = r.item;
     const name = `${run.label(i)}${i.version ? '@' + i.version : ''}`;
     const ev = (r.evidence || []).length ? ` Evidence: ${r.evidence.join(', ')}.` : '';
@@ -65,7 +68,7 @@ async function main() {
   if (!gha.appendSummary(md)) for (const l of md.split('\n')) gha.log(l);
 
   const report = { mode: modeInfo.mode, base: modeInfo.base, failed, counts, api_calls: client.calls, rate_limited: client.rateLimited,
-    results: results.map(r => ({ verdict: r.verdict, unknown_class: run.unknownClass(r), api_verdict: r.api_verdict || null, type: r.item.kind === 'mcp' ? 'mcp' : r.item.kind === 'skip' ? 'source' : r.item.ecosystem, name: run.label(r.item), version: r.item.version || null, files: r.item.files, transitive: !!r.item.transitive, reason: r.reason, evidence: r.evidence || [], signature: r.signature || null })) };
+    results: results.map(r => ({ verdict: r.verdict, unknown_class: run.unknownClass(r), owner_allowed: r.owner_allowed || null, fingerprint: r.item.fingerprint || null, api_verdict: r.api_verdict || null, type: r.item.kind === 'mcp' ? 'mcp' : r.item.kind === 'skip' ? 'source' : r.item.ecosystem, name: run.label(r.item), version: r.item.version || null, files: r.item.files, transitive: !!r.item.transitive, reason: r.reason, evidence: r.evidence || [], signature: r.signature || null })) };
   const reportPath = path.join(process.env.RUNNER_TEMP || require('os').tmpdir(), 'dugganusa-checks-report.json');
   fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
   gha.setOutput('result', failed ? 'fail' : 'pass');
@@ -74,6 +77,7 @@ async function main() {
   gha.setOutput('unknown-count', String(counts.UNKNOWN));
   gha.setOutput('ambiguous-count', String(counts.UNKNOWN_AMBIGUOUS));
   gha.setOutput('unchecked-count', String(counts.UNKNOWN_UNCHECKED));
+  gha.setOutput('owner-allowed-count', String(counts.OWNER_ALLOWED));
   gha.setOutput('allow-count', String(counts.ALLOW));
   gha.setOutput('report-path', reportPath);
 
