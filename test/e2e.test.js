@@ -125,10 +125,14 @@ test('push event runs a full scan of every manifest', async () => {
   } finally { stub.server.close(); }
 });
 
-test('API down: everything UNKNOWN, job passes by default but says so', async () => {
+test('API down: everything UNKNOWN; unchecked fails by default, passes only with fail-on-unchecked false', async () => {
   const { dir, base } = repo();
   const r = await runAction(dir, base, 'http://127.0.0.1:9', { 'max-wait-seconds': '0' });
-  assert.equal(r.code, 0);
+  assert.equal(r.code, 1);
   assert.ok(r.report.results.every(x => x.verdict === 'UNKNOWN'));
-  assert.match(r.summary, /not judged and are not a pass/);
+  assert.ok(r.report.results.some(x => x.unknown_class === 'unchecked'));
+  assert.match(r.summary, /UNKNOWN: unchecked/);
+  const off = await runAction(dir, base, 'http://127.0.0.1:9', { 'max-wait-seconds': '0', 'fail-on-unchecked': 'false' });
+  assert.equal(off.code, 0);
+  assert.match(off.summary, /not judged and are not a pass/);
 });

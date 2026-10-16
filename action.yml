@@ -15,9 +15,13 @@ inputs:
     required: false
     default: block
   fail-on-unknown:
-    description: Fail the job on UNKNOWN of class not_in_corpus (a clean identity nothing judged - no record, remote MCP server, API unavailable). Default false, but every UNKNOWN is still annotated and never counted as a pass.
+    description: Fail the job on UNKNOWN of class not_in_corpus (the API answered and holds no record, or a remote MCP server). Default false, but every UNKNOWN is still annotated and never counted as a pass.
     required: false
     default: 'false'
+  fail-on-unchecked:
+    description: Fail the job on UNKNOWN of class unchecked (a clean identity the API never judged - unreachable, 5xx, timeout, HTTP 429 past the wait budget, max-lookups cap). A pull request can pad itself to exhaust a rate budget or cap, so this defaults to true.
+    required: false
+    default: 'true'
   fail-on-ambiguous:
     description: Fail the job on UNKNOWN of class ambiguous (evasion-shaped - non-canonical MCP launcher, git/URL/file/tarball/alias spec, duplicate or prototype-shaped key, unresolvable override, Gemfile code, a depth/size/count limit hit, an unparsed manifest kind, a non-plain packageManager). Default true.
     required: false
@@ -39,7 +43,7 @@ inputs:
     required: false
     default: 'true'
   max-lookups:
-    description: Maximum API lookups per run. Items past the cap are reported as UNKNOWN (ambiguous, since a PR can pad itself past a cap), never as passed.
+    description: Maximum API lookups per run. Items past the cap are reported as UNKNOWN (unchecked, which fails by default since a PR can pad itself past a cap), never as passed.
     required: false
     default: '200'
   rate-per-minute:
@@ -70,6 +74,8 @@ outputs:
     description: Number of UNKNOWN (not judged) items, both classes
   ambiguous-count:
     description: Number of UNKNOWN items of class ambiguous (evasion-shaped)
+  unchecked-count:
+    description: Number of UNKNOWN items of class unchecked (API never judged them)
   allow-count:
     description: Number of ALLOW verdicts
   report-path:

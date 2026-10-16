@@ -793,8 +793,11 @@ function mcpEntries(j) {
 // is unknown:ambiguous with the reason. No option, path, shell form or extra argument is
 // interpreted, so a new launcher flag, entrypoint, mount, wrapper or PATH trick cannot be judged
 // as the benign package next to it.
-//   command "npx"     args [-y] <pkg>[@version]
-//   command "uvx"     args <pkg>[==version|@version]
+//   command "npx"     args [-y] <pkg>[@version] [plain-arg]...
+//   command "uvx"     args <pkg>[==version|@version] [plain-arg]...
+//                     (npx and uvx stop parsing their own options at the package, so a trailing
+//                     argument that is not flag-shaped goes to the server and cannot change which
+//                     package runs; any arg starting with "-" after the package is ambiguous)
 //   command "docker"  args run [--rm] [-i] [-e NAME]... <image>[:tag|@digest]
 //                     (-e NAME passes a host variable BY NAME into the container; it cannot
 //                     change the image, entrypoint, mounts or command)
@@ -827,20 +830,31 @@ function dockerIdentity(img) {
   return { server, version: digest ? null : (tag && tag !== 'latest' ? tag : null) };
 }
 
+// Arguments after the package: plain values only. Flag-shaped ones are ambiguous because the
+// launcher-level meaning of a flag after the package is launcher- and version-specific.
+function trailingProblem(tail) {
+  const f = tail.find(a => a.startsWith('-'));
+  return f ? `argument ${f.slice(0, 40)} after the package is flag-shaped; only plain arguments may follow the package` : null;
+}
+
 // -> { via, packages: [item], server, version } or { problem }
 function canonicalLaunch(command, args) {
   const bad = (problem) => ({ problem });
   if (command === 'npx') {
     const rest = args[0] === '-y' ? args.slice(1) : args;
-    if (rest.length !== 1) return bad(`npx is canonical only as "npx [-y] <package>[@version]" with nothing else; got ${args.length} argument(s)`);
-    if (rest[0].startsWith('-')) return bad(`npx option ${rest[0].slice(0, 40)} is not part of the canonical form`);
+    if (!rest.length) return bad('npx without a package argument');
+    if (rest[0].startsWith('-')) return bad(`npx option ${rest[0].slice(0, 40)} is not part of the canonical form "npx [-y] <package>[@version] [plain args]"`);
+    const tail = trailingProblem(rest.slice(1));
+    if (tail) return bad(`npx ${tail}`);
     const p = parseNpmSpec(rest[0]);
     if (p.kind !== 'package') return bad(`npx package "${rest[0].slice(0, 80)}": ${p.reason}`);
     if (p.alias) return bad('npx package is an npm: alias');
     return { via: 'npx', packages: [p], server: p.name, version: p.version };
   }
   if (command === 'uvx') {
-    if (args.length !== 1) return bad(`uvx is canonical only as "uvx <package>[==version]" with nothing else; got ${args.length} argument(s)`);
+    if (!args.length) return bad('uvx without a package argument');
+    const tail = trailingProblem(args.slice(1));
+    if (tail) return bad(`uvx ${tail}`);
     const x = UVX_SPEC.exec(args[0]);
     if (!x) return bad(`uvx argument "${args[0].slice(0, 80)}" is not a plain package name (options, --from, extras, paths and URLs are not canonical)`);
     const p = parsePipSpec(x[2] ? `${x[1]}==${x[2]}` : x[1]);

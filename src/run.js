@@ -210,30 +210,35 @@ async function check(items, client, { maxLookups, log }) {
   const results = [];
   const work = sorted.map(async (i) => {
     if (i.kind === 'skip') return { item: i, verdict: 'UNKNOWN', unknown_class: i.cls === 'not_in_corpus' ? 'not_in_corpus' : 'ambiguous', reason: `not checked: ${i.reason}`, evidence: [] };
-    // a count limit is attacker-reachable (pad the PR), so what it cuts off is ambiguous
-    if (used >= maxLookups) return { item: i, verdict: 'UNKNOWN', unknown_class: 'ambiguous', reason: `not checked: lookup cap (max-lookups=${maxLookups}) reached`, evidence: [] };
+    // a count limit is attacker-reachable (pad the PR), so what it cuts off fails by default (unchecked)
+    if (used >= maxLookups) return { item: i, verdict: 'UNKNOWN', unknown_class: 'unchecked', reason: `not checked: lookup cap (max-lookups=${maxLookups}) reached`, evidence: [] };
     used++;
     const r = i.kind === 'mcp' ? await client.checkMcpServer(i) : await client.checkPackage(i);
     log(`${i.kind === 'mcp' ? 'mcp' : i.ecosystem} ${neutralize(label(i), 200)}${i.version ? '@' + neutralize(i.version, 80) : ''}: ${r.verdict}`);
-    // a clean identity the API could not judge (no record, unavailable, rate-limited)
-    return { item: i, ...r, ...(r.verdict === 'UNKNOWN' ? { unknown_class: 'not_in_corpus' } : {}) };
+    // unchecked: the API never answered (unreachable, 5xx, timeout, 429 past the wait budget, bad
+    // response). not_in_corpus: it answered and holds no record.
+    return { item: i, ...r, ...(r.verdict === 'UNKNOWN' ? { unknown_class: r.unknown_class === 'unchecked' ? 'unchecked' : 'not_in_corpus' } : {}) };
   });
   // The client paces and serializes per lane, so starting them all is safe.
   for (const r of await Promise.all(work)) results.push(r);
   return results;
 }
 
-// Two classes of UNKNOWN:
+// Three classes of UNKNOWN:
 //   ambiguous      evasion-shaped (non-canonical launcher, git/url/file/alias spec, duplicate key,
-//                  Gemfile code, a limit hit, unparsed manifest...): fails unless fail-on-ambiguous is false.
-//   not_in_corpus  clean identity, nothing judged it: fails only with fail-on-unknown.
-// fail-on: none disables verdict failures, not the ambiguous gate (that has its own input).
-const unknownClass = (r) => (r.verdict === 'UNKNOWN' ? (r.unknown_class === 'not_in_corpus' ? 'not_in_corpus' : 'ambiguous') : null);
-function decide(results, { failOn, failOnUnknown, failOnAmbiguous = true }) {
-  const counts = { BLOCK: 0, ADVISORY: 0, REVIEW: 0, UNKNOWN: 0, ALLOW: 0, UNKNOWN_AMBIGUOUS: 0, UNKNOWN_NOT_IN_CORPUS: 0 };
+//                  Gemfile code, a parser limit hit, unparsed manifest...): fails unless fail-on-ambiguous is false.
+//   unchecked      a clean identity the API never judged: unreachable, 5xx, timeout, 429 past the wait
+//                  budget, lookup cap. A PR can pad itself to cause this, so it fails unless fail-on-unchecked is false.
+//   not_in_corpus  the API answered and holds no record (or a remote MCP server): fails only with fail-on-unknown.
+// fail-on: none disables verdict failures, not the UNKNOWN gates (they have their own inputs).
+// An UNKNOWN with no recognized class is ambiguous (fail closed).
+const unknownClass = (r) => (r.verdict === 'UNKNOWN' ? (['not_in_corpus', 'unchecked'].includes(r.unknown_class) ? r.unknown_class : 'ambiguous') : null);
+const CLASS_COUNT = { ambiguous: 'UNKNOWN_AMBIGUOUS', unchecked: 'UNKNOWN_UNCHECKED', not_in_corpus: 'UNKNOWN_NOT_IN_CORPUS' };
+function decide(results, { failOn, failOnUnknown, failOnAmbiguous = true, failOnUnchecked = true }) {
+  const counts = { BLOCK: 0, ADVISORY: 0, REVIEW: 0, UNKNOWN: 0, ALLOW: 0, UNKNOWN_AMBIGUOUS: 0, UNKNOWN_UNCHECKED: 0, UNKNOWN_NOT_IN_CORPUS: 0 };
   for (const r of results) {
     counts[r.verdict] = (counts[r.verdict] || 0) + 1;
-    if (r.verdict === 'UNKNOWN') counts[unknownClass(r) === 'ambiguous' ? 'UNKNOWN_AMBIGUOUS' : 'UNKNOWN_NOT_IN_CORPUS']++;
+    if (r.verdict === 'UNKNOWN') counts[CLASS_COUNT[unknownClass(r)]]++;
   }
   const failing = (r) => {
     const v = typeof r === 'string' ? r : r.verdict;
@@ -241,7 +246,7 @@ function decide(results, { failOn, failOnUnknown, failOnAmbiguous = true }) {
     if (failOn === 'review' && (v === 'REVIEW' || v === 'ADVISORY')) return true;
     if (v !== 'UNKNOWN') return false;
     const cls = typeof r === 'string' ? 'ambiguous' : unknownClass(r);
-    return cls === 'ambiguous' ? !!failOnAmbiguous : !!failOnUnknown;
+    return cls === 'ambiguous' ? !!failOnAmbiguous : cls === 'unchecked' ? !!failOnUnchecked : !!failOnUnknown;
   };
   const failed = results.some(r => failing(r));
   return { counts, failed, failing };
@@ -253,22 +258,23 @@ function decide(results, { failOn, failOnUnknown, failOnAmbiguous = true }) {
 function mdCell(s) { return clean(s, 400).replace(/[\\`*_{}\[\]()#!|<>&~:@$]/g, (c) => `&#${c.charCodeAt(0)};`); }
 
 const ICON = { BLOCK: '⛔ BLOCK', ADVISORY: '⚠️ ADVISORY', REVIEW: '⚠️ REVIEW', UNKNOWN: '❔ UNKNOWN', ALLOW: '✅ ALLOW' };
-const icon = (r) => (r.verdict === 'UNKNOWN' ? (unknownClass(r) === 'ambiguous' ? '🚩 UNKNOWN: ambiguous' : '❔ UNKNOWN: not in corpus') : ICON[r.verdict]);
+const CLASS_LABEL = { ambiguous: '🚩 UNKNOWN: ambiguous', unchecked: '⏳ UNKNOWN: unchecked', not_in_corpus: '❔ UNKNOWN: not in corpus' };
+const icon = (r) => (r.verdict === 'UNKNOWN' ? CLASS_LABEL[unknownClass(r)] : ICON[r.verdict]);
 
-function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, failOnAmbiguous = true, keyed, client, transitive }) {
+function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, failOnAmbiguous = true, failOnUnchecked = true, keyed, client, transitive }) {
   const L = [];
   L.push('## DugganUSA Checks');
   L.push('');
   L.push(`**Result: ${failed ? 'FAILED' : 'passed'}** · ${mdCell(modeInfo.reason)}${modeInfo.mode === 'diff' ? (transitive ? ' (lockfile transitives included)' : '') : (transitive ? '' : ' (lockfile transitives skipped; set include-transitive: true)')}`);
   L.push('');
-  const amb = counts.UNKNOWN_AMBIGUOUS || 0; const nic = counts.UNKNOWN_NOT_IN_CORPUS || 0;
-  L.push(`| BLOCK | ADVISORY | REVIEW | UNKNOWN: ambiguous | UNKNOWN: not in corpus | ALLOW |`);
-  L.push(`|---:|---:|---:|---:|---:|---:|`);
-  L.push(`| ${counts.BLOCK} | ${counts.ADVISORY} | ${counts.REVIEW} | ${amb} | ${nic} | ${counts.ALLOW} |`);
+  const amb = counts.UNKNOWN_AMBIGUOUS || 0; const unc = counts.UNKNOWN_UNCHECKED || 0; const nic = counts.UNKNOWN_NOT_IN_CORPUS || 0;
+  L.push(`| BLOCK | ADVISORY | REVIEW | UNKNOWN: ambiguous | UNKNOWN: unchecked | UNKNOWN: not in corpus | ALLOW |`);
+  L.push(`|---:|---:|---:|---:|---:|---:|---:|`);
+  L.push(`| ${counts.BLOCK} | ${counts.ADVISORY} | ${counts.REVIEW} | ${amb} | ${unc} | ${nic} | ${counts.ALLOW} |`);
   L.push('');
-  L.push(`Fails on: BLOCK${failOn === 'review' ? ', REVIEW, ADVISORY' : ''}${failOn === 'none' ? ' (disabled: fail-on none)' : ''}${failOnAmbiguous ? ', UNKNOWN: ambiguous' : ''}${failOnUnknown ? ', UNKNOWN: not in corpus' : ''}. ${counts.UNKNOWN && (!failOnUnknown || !failOnAmbiguous) ? `**${counts.UNKNOWN} UNKNOWN: these were not judged and are not a pass.**` : ''}`);
+  L.push(`Fails on: BLOCK${failOn === 'review' ? ', REVIEW, ADVISORY' : ''}${failOn === 'none' ? ' (disabled: fail-on none)' : ''}${failOnAmbiguous ? ', UNKNOWN: ambiguous' : ''}${failOnUnchecked ? ', UNKNOWN: unchecked' : ''}${failOnUnknown ? ', UNKNOWN: not in corpus' : ''}. ${counts.UNKNOWN && (!failOnUnknown || !failOnAmbiguous || !failOnUnchecked) ? `**${counts.UNKNOWN} UNKNOWN: these were not judged and are not a pass.**` : ''}`);
   L.push('');
-  L.push('**UNKNOWN: ambiguous** means the entry is evasion-shaped: this check could not prove what would be installed or run (a non-canonical MCP launcher, a git/URL/file/alias spec, a duplicate key, Gemfile code, a limit hit, an unparsed manifest). It fails by default (`fail-on-ambiguous`). **UNKNOWN: not in corpus** means the identity is clean but nothing judged it (no record, remote server, API unavailable); it fails only with `fail-on-unknown`.');
+  L.push('**UNKNOWN: ambiguous** means the entry is evasion-shaped: this check could not prove what would be installed or run (a non-canonical MCP launcher, a git/URL/file/alias spec, a duplicate key, Gemfile code, a parser limit hit, an unparsed manifest). It fails by default (`fail-on-ambiguous`). **UNKNOWN: unchecked** means the identity is clean but the API never judged it (unreachable, 5xx, timeout, rate limit past the wait budget, lookup cap); a pull request can pad itself to cause this, so it fails by default (`fail-on-unchecked`). **UNKNOWN: not in corpus** means the API answered and holds no record (or a remote MCP server); it fails only with `fail-on-unknown`.');
   L.push('');
   if (results.length) {
     L.push('| Verdict | Type | Name | Version | File | Reason | Evidence |');

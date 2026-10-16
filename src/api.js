@@ -106,11 +106,11 @@ class Client {
       headers: this.headers({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'check-package', arguments: args } }),
     });
-    if (!res.ok) return { verdict: 'UNKNOWN', api_verdict: null, reason: `check-package not completed: ${res.error}`, evidence: [] };
+    if (!res.ok) return { verdict: 'UNKNOWN', unknown_class: 'unchecked', api_verdict: null, reason: `check-package not completed: ${res.error}`, evidence: [] };
     const d = res.json || {};
-    if (d.error) return { verdict: 'UNKNOWN', api_verdict: null, reason: `check-package error: ${clean(d.error.message, 160)}`, evidence: [] };
+    if (d.error) return { verdict: 'UNKNOWN', unknown_class: 'unchecked', api_verdict: null, reason: `check-package error: ${clean(d.error.message, 160)}`, evidence: [] };
     let out;
-    try { out = JSON.parse(d.result.content[0].text); } catch { return { verdict: 'UNKNOWN', api_verdict: null, reason: 'check-package returned an unreadable result', evidence: [] }; }
+    try { out = JSON.parse(d.result.content[0].text); } catch { return { verdict: 'UNKNOWN', unknown_class: 'unchecked', api_verdict: null, reason: 'check-package returned an unreadable result', evidence: [] }; }
     return normalizePackage(out, { version });
   }
 
@@ -118,7 +118,7 @@ class Client {
     const qs = new URLSearchParams({ server });
     if (version) qs.set('version', version);
     const res = await this.request('mcp', `${this.base}/api/v1/dredd/preflight?${qs}`, { method: 'GET', headers: this.headers() });
-    if (!res.ok) return { verdict: 'UNKNOWN', api_verdict: null, reason: `Dredd preflight not completed: ${res.error}`, evidence: [] };
+    if (!res.ok) return { verdict: 'UNKNOWN', unknown_class: 'unchecked', api_verdict: null, reason: `Dredd preflight not completed: ${res.error}`, evidence: [] };
     return normalizeDredd(res.json || {});
   }
 }

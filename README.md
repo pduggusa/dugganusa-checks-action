@@ -51,11 +51,11 @@ Sources that cannot be judged by name are never silently dropped. A git URL, a t
 
 The parsers follow what the installer actually does, and anything they cannot classify is UNKNOWN rather than skipped. Since the second security review the rules are **invariants, not lists of bad shapes**:
 
-- **MCP launch identity is judged only for canonical forms.** `command` must be exactly `npx`, `uvx` or `docker` (no path, no `.cmd`, no wrapper), with args exactly `[-y] <pkg>[@version]` (npx), `<pkg>[==version|@version]` (uvx) or `run [--rm] [-i] [-e NAME]... <image>[:tag|@digest]` (docker), nothing after the package or image, no entry keys beyond `command`/`args`/`env`/`type: stdio` and display metadata (so `cwd`, `envFile` and friends are out), and an `env` that sets none of `PATH`, `HOME`, `NODE_*`, `NODE_PATH`, `NODE_OPTIONS`, `npm_config_*`, `PIP_*`, `UV_*`, `PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `DOCKER_*`, proxies or CA bundles. An npx package whose name matches a package or a non-registry dependency in this repository is also ambiguous (npx may run the local copy). Everything else is UNKNOWN: ambiguous, with the reason. Remote servers (`url`/`type: http|sse`) are reported by host as UNKNOWN: not in corpus.
+- **MCP launch identity is judged only for canonical forms.** `command` must be exactly `npx`, `uvx` or `docker` (no path, no `.cmd`, no wrapper), with args exactly `[-y] <pkg>[@version]` (npx) or `<pkg>[==version|@version]` (uvx), optionally followed by plain (non-flag) arguments for the server, or `run [--rm] [-i] [-e NAME]... <image>[:tag|@digest]` (docker), nothing flag-shaped after the package and nothing at all after the image, no entry keys beyond `command`/`args`/`env`/`type: stdio` and display metadata (so `cwd`, `envFile` and friends are out), and an `env` that sets none of `PATH`, `HOME`, `NODE_*`, `NODE_PATH`, `NODE_OPTIONS`, `npm_config_*`, `PIP_*`, `UV_*`, `PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `DOCKER_*`, proxies or CA bundles. An npx package whose name matches a package or a non-registry dependency in this repository is also ambiguous (npx may run the local copy). Everything else is UNKNOWN: ambiguous, with the reason. Remote servers (`url`/`type: http|sse`) are reported by host as UNKNOWN: not in corpus.
 - **Local code is ambiguous everywhere** (`file:`/`link:`/relative-path specs, pip local paths and `-e .`, Poetry/uv path sources, `gemspec`, Gemfile.lock `PATH`). Only a declared `workspace:` member is a notice.
 - **Gemfile:** only blank/comment lines, `source "url"`, `ruby "x"`, static `gem "name", "req", key: value` lines, `group`/`platforms`/`source ... do` blocks with a matching `end`, and the static `git_source` URL template are read. From the first line outside that subset to the end of the file, every entry is UNKNOWN: ambiguous.
 - **JSON and TOML** objects are null-prototype; a `__proto__`, `constructor` or `prototype` key makes the file UNKNOWN: ambiguous.
-- **Every limit** (lockfile nesting, override nesting, duplicate-key listing, directory depth, file size, line length, include depth, `max-lookups`) reports what it cut off as UNKNOWN: ambiguous. Nothing is truncated silently.
+- **Every limit** (lockfile nesting, override nesting, duplicate-key listing, directory depth, file size, line length, include depth) reports what it cut off as UNKNOWN: ambiguous; the `max-lookups` cap and an exhausted rate-limit budget report UNKNOWN: unchecked. Nothing is truncated silently, and both fail by default.
 - **Scanned surfaces:** `package.json` (including `packageManager`: anything but a plain `npm|pnpm|yarn@x.y.z[+sha...]` is ambiguous), `package-lock.json`/`npm-shrinkwrap.json`, `requirements*.txt`, `pyproject.toml` (a `dynamic` dependency list or `tool.setuptools.dynamic` is ambiguous), `poetry.lock`, `Gemfile`/`Gemfile.lock`, and MCP configs: any `mcp.json` or `*.mcp.json`, `claude_desktop_config.json`, `.claude/settings*.json`, `.vscode/settings.json`, `.gemini/settings.json`, `.cursor/settings.json`. Formats we do not parse (`yarn.lock`, `pnpm-lock.yaml`, `uv.lock`, `Pipfile.lock`, `requirements*.in`, `setup.py`, ...) and installer config that redirects a registry (`.npmrc`, `pip.conf`, `uv.toml`, ...) are UNKNOWN: ambiguous when they change.
 
 Files are read only if they are regular files inside the workspace: symlinks, FIFOs, devices and files over 32 MB are refused and reported as UNKNOWN.
@@ -68,20 +68,22 @@ Files are read only if they are regular files inside the workspace: symlinks, FI
 | **ADVISORY** | MCP server with a published CVE affecting this version | Warning |
 | **REVIEW** | Not malicious, but this version has published vulnerabilities; or a suspicious reputation; or Dredd ALLOW without a dependency scan | Warning |
 | **UNKNOWN: ambiguous** | Evasion-shaped: this check could not prove what would be installed or run (non-canonical MCP launcher, git/URL/file/tarball/alias spec, duplicate or prototype-shaped key, unresolvable override, Gemfile code, a limit hit, an unparsed manifest kind, a non-plain `packageManager`) | **Fails the job** (`fail-on-ambiguous`, default true) |
-| **UNKNOWN: not in corpus** | A clean identity nothing judged: server or package not in our catalog, remote MCP server, API unreachable, rate limit | Warning that says **not a pass** (`fail-on-unknown`, default false) |
+| **UNKNOWN: unchecked** | A clean identity the API never judged: unreachable, 5xx, timeout, HTTP 429 past the wait budget, `max-lookups` cap | **Fails the job** (`fail-on-unchecked`, default true): a pull request can pad itself to exhaust a rate budget |
+| **UNKNOWN: not in corpus** | The API answered and holds no record (server or package not in our catalog), or a remote MCP server | Warning that says **not a pass** (`fail-on-unknown`, default false) |
 | **ALLOW** | No known evidence against it | Nothing |
 
 Inputs that change this:
 
 - `fail-on: review` also fails on REVIEW and ADVISORY. `fail-on: none` reports only.
 - `fail-on-unknown: true` also fails on UNKNOWN: not in corpus.
+- `fail-on-unchecked: false` turns UNKNOWN: unchecked into a warning (for example on a keyless full scan you know will hit the rate limit). Then a pull request that adds enough packages to exhaust the budget can leave the malicious one unchecked and still pass.
 - `fail-on-ambiguous: false` turns UNKNOWN: ambiguous into a warning. Do this only if you accept that a pull request can hide a BLOCK behind a git spec, a duplicate key or a wrapped launcher.
 
 ### Read this before trusting a green check
 
 - **ALLOW is not proof of safety.** It means our deny-list, the reputation signals and OSV hold nothing against that name and version today. A package published an hour ago by an attacker can look exactly like that.
-- **UNKNOWN is not a pass**, and it is counted, annotated and listed in the summary every time, split into its two classes. An **ambiguous** UNKNOWN fails by default: before this split, a BLOCK could be turned into a passing UNKNOWN just by rewriting the dependency as a git spec or adding a duplicate key. A **not in corpus** UNKNOWN does not fail by default, because an unknown-but-clean MCP server is common and a check that is always red gets switched off. For the strict posture, set `fail-on-unknown: true`.
-- **The canonical forms are strict on purpose.** `npx -y @modelcontextprotocol/server-filesystem /some/dir` is ambiguous, because arguments after the package are handed to whatever that package runs (`npx -y tsx ./evil.ts` has the same shape). Pin the server to a canonical form, or accept the finding.
+- **UNKNOWN is not a pass**, and it is counted, annotated and listed in the summary every time, split into its three classes. An **ambiguous** UNKNOWN fails by default: before this split, a BLOCK could be turned into a passing UNKNOWN just by rewriting the dependency as a git spec or adding a duplicate key. An **unchecked** UNKNOWN (the API never answered for it) also fails by default, because padding a pull request until the rate budget or `max-lookups` runs out is the same trick. A **not in corpus** UNKNOWN does not fail by default, because an unknown-but-clean MCP server is common and a check that is always red gets switched off. For the strict posture, set `fail-on-unknown: true`.
+- **The canonical forms are strict on purpose.** `npx -y @modelcontextprotocol/server-filesystem /some/dir` is judged as the package: npx and uvx stop reading their own options at the package, so a plain argument after it cannot change which package runs. Anything flag-shaped after the package, and anything before it beyond `-y`, is ambiguous. Note what that does not cover: a plain argument is handed to whatever the package runs, so a general-purpose runner package (`npx -y tsx ./evil.ts`) is judged as the runner, not as the script it runs.
 - **A range is checked by name only.** `"express": "^4.18.0"` gets the malicious-package check but not the version vulnerability check. Commit your lockfile and the exact versions are checked.
 - No check is perfect. We cap our own confidence at 95%: something in any verdict list will be wrong, and you should treat these verdicts as one input to a decision, not a guarantee.
 
@@ -93,18 +95,19 @@ Inputs that change this:
 | `fail-on` | `block` | `block`, `review` or `none` |
 | `fail-on-unknown` | `false` | Also fail on UNKNOWN: not in corpus |
 | `fail-on-ambiguous` | `true` | Fail on UNKNOWN: ambiguous (evasion-shaped) |
+| `fail-on-unchecked` | `true` | Fail on UNKNOWN: unchecked (API outage, rate limit, lookup cap) |
 | `mode` | `auto` | `auto` (diff on `pull_request`/`merge_group`, full otherwise), `diff`, `full` |
 | `base-ref` | PR base SHA | Commit to diff against |
 | `include-transitive` | `auto` | Lockfile transitives: yes in diff mode, no in full scans |
 | `check-mcp` | `true` | Check MCP server configs with Dredd |
-| `max-lookups` | `200` | Lookup cap per run; the rest are reported UNKNOWN: ambiguous |
+| `max-lookups` | `200` | Lookup cap per run; the rest are reported UNKNOWN: unchecked |
 | `rate-per-minute` | auto | Client-side pacing for package lookups (10/min keyless, 60/min keyed) |
 | `max-wait-seconds` | `300` | Total time the run may wait out HTTP 429s |
 | `working-directory` | `.` | Directory to scan |
 
 ## Outputs
 
-`result` (`pass`/`fail`), `block-count`, `review-count` (REVIEW plus ADVISORY), `unknown-count` (both classes), `ambiguous-count`, `allow-count`, and `report-path`: a JSON file with every verdict, reason, evidence ID and, for Dredd, the response signature.
+`result` (`pass`/`fail`), `block-count`, `review-count` (REVIEW plus ADVISORY), `unknown-count` (both classes), `ambiguous-count`, `unchecked-count`, `allow-count`, and `report-path`: a JSON file with every verdict, reason, evidence ID and, for Dredd, the response signature.
 
 ## Rate limits
 

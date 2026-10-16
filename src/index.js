@@ -14,6 +14,7 @@ async function main() {
   if (!run.FAIL_ON.includes(failOn)) throw new Error(`fail-on must be one of ${run.FAIL_ON.join(', ')}`);
   const failOnUnknown = gha.getBool('fail-on-unknown', false);
   const failOnAmbiguous = gha.getBool('fail-on-ambiguous', true);
+  const failOnUnchecked = gha.getBool('fail-on-unchecked', true);
   const modeInput = gha.getInput('mode', 'auto').toLowerCase();
   if (!['auto', 'diff', 'full'].includes(modeInput)) throw new Error('mode must be auto, diff or full');
   const includeTransitive = gha.getInput('include-transitive', 'auto').toLowerCase();
@@ -46,7 +47,7 @@ async function main() {
   const results = await run.check(items, client, { maxLookups, log: (m) => gha.log(`  ${m}`) });
   gha.endGroup();
 
-  const { counts, failed, failing } = run.decide(results, { failOn, failOnUnknown, failOnAmbiguous });
+  const { counts, failed, failing } = run.decide(results, { failOn, failOnUnknown, failOnAmbiguous, failOnUnchecked });
 
   for (const r of results) {
     if (r.verdict === 'ALLOW') continue;
@@ -55,12 +56,12 @@ async function main() {
     const ev = (r.evidence || []).length ? ` Evidence: ${r.evidence.join(', ')}.` : '';
     const level = failing(r) ? 'error' : 'warning';
     const cls = run.unknownClass(r);
-    const lead = r.verdict === 'UNKNOWN' ? `UNKNOWN: ${cls === 'ambiguous' ? 'ambiguous' : 'not in corpus'} (not judged, NOT a pass)` : r.verdict;
+    const lead = r.verdict === 'UNKNOWN' ? `UNKNOWN: ${cls.replace(/_/g, ' ')} (not judged, NOT a pass)` : r.verdict;
     gha.annotate(level, `${lead}: ${name}. ${String(r.reason).replace(/[.\s]+$/, "")}.${ev}`, { file: annFile(i.files[0]), line: i.line, title: `DugganUSA Checks: ${r.verdict}${cls ? ' ' + cls : ''}` });
   }
   for (const n of notes) if (n.level === 'warning') gha.annotate('warning', n.text, { file: annFile(n.file), title: 'DugganUSA Checks' });
 
-  const md = run.summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, failOnAmbiguous, keyed: !!apiKey, client, transitive });
+  const md = run.summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, failOnUnknown, failOnAmbiguous, failOnUnchecked, keyed: !!apiKey, client, transitive });
   if (!gha.appendSummary(md)) for (const l of md.split('\n')) gha.log(l);
 
   const report = { mode: modeInfo.mode, base: modeInfo.base, failed, counts, api_calls: client.calls, rate_limited: client.rateLimited,
@@ -72,10 +73,11 @@ async function main() {
   gha.setOutput('review-count', String(counts.REVIEW + counts.ADVISORY));
   gha.setOutput('unknown-count', String(counts.UNKNOWN));
   gha.setOutput('ambiguous-count', String(counts.UNKNOWN_AMBIGUOUS));
+  gha.setOutput('unchecked-count', String(counts.UNKNOWN_UNCHECKED));
   gha.setOutput('allow-count', String(counts.ALLOW));
   gha.setOutput('report-path', reportPath);
 
-  gha.log(`DugganUSA Checks: ${counts.BLOCK} block, ${counts.ADVISORY} advisory, ${counts.REVIEW} review, ${counts.UNKNOWN} unknown (${counts.UNKNOWN_AMBIGUOUS} ambiguous), ${counts.ALLOW} allow -> ${failed ? 'FAIL' : 'pass'}`);
+  gha.log(`DugganUSA Checks: ${counts.BLOCK} block, ${counts.ADVISORY} advisory, ${counts.REVIEW} review, ${counts.UNKNOWN} unknown (${counts.UNKNOWN_AMBIGUOUS} ambiguous, ${counts.UNKNOWN_UNCHECKED} unchecked), ${counts.ALLOW} allow -> ${failed ? 'FAIL' : 'pass'}`);
   if (failed) process.exitCode = 1;
 }
 
