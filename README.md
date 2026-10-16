@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dugganusa/dugganusa-checks-action@v1
+      - uses: pduggusa/dugganusa-checks-action@v1
         with:
           api-key: ${{ secrets.DUGGANUSA_API_KEY }}   # optional
 ```

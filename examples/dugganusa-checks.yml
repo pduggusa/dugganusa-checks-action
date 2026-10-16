@@ -29,7 +29,7 @@ jobs:
         with:
           fetch-depth: 0          # the diff needs the PR base commit
           persist-credentials: false
-      - uses: dugganusa/dugganusa-checks-action@v1
+      - uses: pduggusa/dugganusa-checks-action@v1
         with:
           api-key: ${{ secrets.DUGGANUSA_API_KEY }}   # optional; keyless works at the free rate
           fail-on: block          # or: review
