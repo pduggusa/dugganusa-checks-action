@@ -23,7 +23,7 @@ inputs:
     required: false
     default: 'true'
   allow-ambiguous:
-    description: Owner gate. Newline list of sha256 fingerprints (optionally prefixed by a label such as ".mcp.json#filesystem") of exact ambiguous MCP entries to accept. Honored only when the fingerprint matches the entry as it stands (any change to command, args, env or options re-triggers). Honored entries are listed as ALLOWED BY OWNER, and the package they fetch is still checked.
+    description: Owner gate. Newline list of sha256 fingerprints (optionally prefixed by a label such as ".mcp.json#filesystem") of exact ambiguous MCP entries to accept. Honored only when the fingerprint matches the entry AND its launcher context as they stand (any change re-triggers), and only when every reason on the entry is entry_shape; context-derived reasons are never waivable. Honored entries are listed as ALLOWED BY OWNER, and the package they fetch is still checked.
     required: false
     default: ''
   fail-on-ambiguous:

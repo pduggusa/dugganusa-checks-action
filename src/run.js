@@ -124,9 +124,11 @@ function lineOf(text, needle) {
 }
 
 // Collect checkable items from the repo. -> { items: [...], notes: [...] }
-// Owner gate fingerprint of one MCP entry: sha256 over the file path and the canonical JSON of the
-// entry (its container path, every key and value, and any top-level env). Any change re-triggers.
-function mcpFingerprint(file, fp) { return 'sha256:' + crypto.createHash('sha256').update(`${file}\n${fp}`).digest('hex'); }
+// Owner gate fingerprint of one MCP entry: sha256 over the file path, the canonical JSON of the
+// entry (its container path, every key and value, and any top-level env), the launcher, and the
+// launcher-context digest (every context file the classifier consults for that launcher). Any
+// change to the entry OR its context re-triggers the gate.
+function mcpFingerprint(file, fp, launcher = null, ctxDigest = null) { return 'sha256:' + crypto.createHash('sha256').update(`${file}\n${fp}\n${launcher || ''}\n${ctxDigest || ''}`).digest('hex'); }
 // allow-ambiguous lines -> Set of fingerprints. A line is honored only through its fingerprint;
 // a line without one (just a name) is returned in `rejected` and never honors anything.
 function parseAllowAmbiguous(text) {
@@ -139,6 +141,10 @@ function parseAllowAmbiguous(text) {
   }
   return { allowed, rejected };
 }
+
+// Reason codes an owner allowance cannot waive. Allow-by-code: anything not in parsers.WAIVABLE,
+// including codes added later and an entry with no recorded reason, is non-waivable.
+function nonWaivable(reasons) { return (Array.isArray(reasons) && reasons.length ? reasons : ['other']).filter(c => !parsers.WAIVABLE.has(c)); }
 
 function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter, allowAmbiguous = new Set() }) {
   const notes = [];
@@ -190,73 +196,88 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter, all
     for (const e of errors) notes.push({ file: f, text: `${f} ${e}`, level: 'warning' });
     for (const it of items) addItem(f, it, newText);
   }
-  // npx (npm exec) prefers an executable already in the project (node_modules/.bin: bins of every
-  // dependency and workspace, and the root package's own bin) over the registry package we judge.
-  // Every package.json and npm lockfile in the repository is read for this, changed or not, and a
-  // committed node_modules/.bin entry counts too. Match on the full and the unscoped name.
-  const npx = [...byKey.entries()].filter(([, i]) => i.kind === 'mcp' && i.via === 'npx');
-  const uvx = [...byKey.entries()].filter(([, i]) => i.kind === 'mcp' && i.via === 'uvx');
-  // Repository context that re-points a canonical launcher without touching the MCP entry: npm
-  // reads the project .npmrc (registry=), uv reads uv.toml / pyproject [tool.uv] / pip config from
-  // the working directory. Such a file anywhere in the repository makes those launches ambiguous,
-  // changed in this PR or not.
-  const relaunch = (list, why) => { for (const [k, i] of list) byKey.set(k, { ...parsers.unknown(i.key, `MCP server "${i.key}": ${why}`), where: i.where, mcpEntry: true, fp: i.fp, files: i.files, line: i.line, change: i.change }); };
-  if (npx.length || uvx.length) {
-    const npmCfg = []; const pyCfg = [];
-    for (const f of listFiles(cwd)) {
-      const kind = parsers.manifestKind(f);
-      const b = path.posix.basename(f);
-      try {
-        if (kind === 'install-config') {
-          if (parsers.parse('install-config', parsers.decode(kind, safeRead(cwd, f)), { file: f }).size === 0) continue;
-          (/^\.(npmrc|yarnrc|yarnrc\.yml)$|^bunfig\.toml$/.test(b) ? npmCfg : pyCfg).push(f);
-        } else if (kind === 'pyproject') {
-          const t = require('./toml').parseToml(parsers.decode(kind, safeRead(cwd, f)));
-          const uvt = t.tool && t.tool.uv;
-          if (uvt && ['index', 'index-url', 'extra-index-url', 'find-links', 'no-index', 'sources'].some(x => uvt[x] !== undefined)) pyCfg.push(f);
-        }
-      } catch { if (kind === 'install-config' || kind === 'pyproject') (kind === 'pyproject' ? pyCfg : npmCfg).push(f); }
-    }
-    if (npmCfg.length) relaunch(npx.filter(([k]) => byKey.get(k).kind === 'mcp'), `npm reads ${npmCfg[0]}, which redirects where packages are fetched from, so npx may not fetch the registry package that was judged`);
-    if (pyCfg.length) relaunch(uvx, `uv reads ${pyCfg[0]}, which redirects where packages are fetched from, so uvx may not fetch the PyPI package that was judged`);
+  // ---- Launcher context and the owner gate ---------------------------------------------------
+  // A canonical launcher can be re-pointed by repository context the entry never mentions:
+  //   npx: a .npmrc/.yarnrc/.yarnrc.yml/bunfig.toml registry redirect; a local executable npm exec
+  //        prefers (node_modules/.bin, any package.json name/dependency/bin, lockfile bins).
+  //   uvx: uv.toml/pip.conf/pip.ini/poetry.toml, or pyproject [tool.uv] index settings.
+  // These are checked for EVERY MCP entry with that launcher, judged or already ambiguous, and
+  // the files consulted (present ones, by path and content hash) form a context digest that is
+  // bound into the owner-gate fingerprint: adding, removing or editing any of them re-triggers it.
+  const allFiles = listFiles(cwd);
+  const NPM_CFG = /^\.(npmrc|yarnrc|yarnrc\.yml)$|^bunfig\.toml$/;
+  const PY_CFG = /^(uv\.toml|pip\.conf|pip\.ini|poetry\.toml)$/;
+  const ctx = { npx: { consulted: [], redirect: [], shadow: new Set(), bins: new Set() }, uvx: { consulted: [], redirect: [] }, docker: { consulted: [] } };
+  const hashOf = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+  for (const f of allFiles) {
+    const b = path.posix.basename(f);
+    const kind = parsers.manifestKind(f);
+    const bm = /(^|\/)node_modules\/\.bin\/([^/]+?)(\.cmd|\.ps1)?$/i.exec(f);
+    const lane = bm || NPM_CFG.test(b) || kind === 'package.json' || kind === 'package-lock' ? 'npx' : (PY_CFG.test(b) || kind === 'pyproject') ? 'uvx' : null;
+    if (!lane) continue;
+    let buf = null;
+    try { buf = safeRead(cwd, f); } catch { /* unreadable context: still consulted, fails closed below */ }
+    ctx[lane].consulted.push(`${f}\0${buf ? hashOf(buf) : 'unreadable'}`);
+    if (bm) { ctx.npx.bins.add(bm[2].toLowerCase()); continue; }
+    if (!buf) { if (NPM_CFG.test(b) || PY_CFG.test(b)) ctx[lane].redirect.push(f); continue; }
+    try {
+      if (NPM_CFG.test(b) || PY_CFG.test(b)) { if (parsers.parse('install-config', parsers.decode('install-config', buf), { file: f }).size) ctx[lane].redirect.push(f); }
+      else if (kind === 'pyproject') {
+        const t = require('./toml').parseToml(parsers.decode(kind, buf));
+        const uvt = t.tool && t.tool.uv;
+        if (uvt && ['index', 'index-url', 'extra-index-url', 'find-links', 'no-index', 'sources'].some(x => uvt[x] !== undefined)) ctx.uvx.redirect.push(f);
+      } else {
+        const text = parsers.decode(kind, buf);
+        for (const n of (kind === 'package.json' ? parsers.localNpmNames(text) : parsers.lockfileNpmNames(text))) ctx.npx.shadow.add(n);
+      }
+    } catch { if (kind === 'pyproject') ctx.uvx.redirect.push(f); }
   }
-  if (npx.some(([k]) => byKey.get(k).kind === 'mcp')) {
-    const shadow = new Set();
-    const binFiles = new Set();
-    for (const f of listFiles(cwd)) {
-      const bm = /(^|\/)node_modules\/\.bin\/([^/]+?)(\.cmd|\.ps1)?$/i.exec(f);
-      if (bm) { binFiles.add(bm[2].toLowerCase()); continue; }
-      const kind = parsers.manifestKind(f);
-      if (kind !== 'package.json' && kind !== 'package-lock') continue;
-      try {
-        const text = parsers.decode(kind, safeRead(cwd, f));
-        for (const n of (kind === 'package.json' ? parsers.localNpmNames(text) : parsers.lockfileNpmNames(text))) shadow.add(n);
-      } catch { /* unreadable: reported elsewhere if changed */ }
-    }
-    for (const [k, i] of npx) {
-      if (byKey.get(k).kind !== 'mcp') continue;
-      const full = String(i.server).toLowerCase();
+  for (const lane of Object.keys(ctx)) ctx[lane].digest = hashOf(ctx[lane].consulted.sort().join('\n'));
+
+  const contextReasons = (launcher, name) => {
+    const out = [];
+    const c = ctx[launcher];
+    if (!c) return out;
+    if (c.redirect && c.redirect.length) out.push({ code: 'registry_redirect', text: `${launcher === 'npx' ? 'npm' : 'uv'} reads ${c.redirect[0]}, which redirects where packages are fetched from, so ${launcher} may not fetch the package that was judged` });
+    if (launcher === 'npx' && name) {
+      const full = String(name).toLowerCase();
       const short = full.replace(/^@[^/]+\//, '');
       let why = null;
-      if (binFiles.has(short) || binFiles.has(full)) why = `a committed node_modules/.bin/${short} exists`;
-      else {
-        try { fs.lstatSync(path.join(cwd, 'node_modules', '.bin', short)); why = `node_modules/.bin/${short} exists in the workspace`; } catch { /* absent */ }
-      }
-      if (!why && (shadow.has(full) || shadow.has(short))) why = `a package, dependency or bin named "${shadow.has(full) ? full : short}" is declared in this repository`;
-      if (!why) continue;
-      byKey.set(k, { ...parsers.unknown(i.key, `MCP server "${i.key}": npx package "${i.server}" may run local code instead of the registry package (${why}; npm exec prefers a matching local executable)`), where: i.where, mcpEntry: true, fp: i.fp, files: i.files, line: i.line, change: i.change });
+      if (c.bins.has(short) || c.bins.has(full)) why = `a committed node_modules/.bin/${short} exists`;
+      else { try { fs.lstatSync(path.join(cwd, 'node_modules', '.bin', short)); why = `node_modules/.bin/${short} exists in the workspace`; } catch { /* absent */ } }
+      if (!why && (c.shadow.has(full) || c.shadow.has(short))) why = `a package, dependency or bin named "${c.shadow.has(full) ? full : short}" is declared in this repository`;
+      if (why) out.push({ code: 'local_bin_shadow', text: `npx package "${name}" may run local code instead of the registry package (${why}; npm exec prefers a matching local executable)` });
     }
+    return out;
+  };
+
+  for (const [k, i] of [...byKey.entries()]) {
+    const isEntry = i.kind === 'mcp' || (i.kind === 'skip' && i.mcpEntry);
+    if (!isEntry || !i.launcher) continue;
+    const extra = contextReasons(i.launcher, i.launchName);
+    let it = i;
+    if (extra.length) {
+      it = i.kind === 'mcp'
+        ? { ...parsers.unknown(i.key, `MCP server "${i.key}": ${extra.map(x => x.text).join('; ')}`), reasons: extra.map(x => x.code), where: i.where, mcpEntry: true, fp: i.fp, launcher: i.launcher, launchName: i.launchName, files: i.files, line: i.line, change: i.change }
+        : { ...i, reason: `${i.reason}; ${extra.map(x => x.text).join('; ')}`, reasons: [...new Set([...(i.reasons || ['other']), ...extra.map(x => x.code)])] };
+      byKey.set(k, it);
+    }
+    if (it.kind === 'skip') it.ctxDigest = ctx[it.launcher] ? ctx[it.launcher].digest : null;
   }
-  // Owner gate: an ambiguous MCP entry is honored only when allow-ambiguous carries the
-  // fingerprint of exactly this entry as it stands now. Honored entries stay listed (never
-  // silently passed) and the package the entry would fetch, when there is one, is still checked.
+
+  // Owner gate: honored only when (a) allow-ambiguous carries the fingerprint of this exact entry
+  // AND its launcher context as they stand now, and (b) EVERY reason on the entry is waivable
+  // (parsers.WAIVABLE = entry_shape only; any other or future code is non-waivable). Honored
+  // entries stay listed, and the package the entry would fetch is still checked.
   const honored = new Set();
   for (const i of [...byKey.values()]) {
     if (!(i.kind === 'skip' && i.mcpEntry && i.fp != null)) continue;
-    i.fingerprint = mcpFingerprint(i.files[0], i.fp);
+    i.fingerprint = mcpFingerprint(i.files[0], i.fp, i.launcher, i.ctxDigest);
     if (!allowAmbiguous.has(i.fingerprint)) continue;
-    i.owner_allowed = true;
     honored.add(i.fingerprint);
+    const blocking = nonWaivable(i.reasons);
+    if (blocking.length) { notes.push({ file: i.files[0], text: `allow-ambiguous ${i.fingerprint} matches "${i.key}" but was NOT applied: non-waivable reason(s) ${blocking.join(', ')}`, level: 'warning' }); continue; }
+    i.owner_allowed = true;
     if (i.candidate) addItem(i.files[0], { ...i.candidate, change: i.change }, texts[i.files[0]] || '');
   }
   let items = [...byKey.values()];
@@ -379,4 +400,4 @@ function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, fai
   return L.join('\n');
 }
 
-module.exports = { mcpFingerprint, parseAllowAmbiguous, unknownClass, listFiles, resolveMode, ensureCommit, collect, check, decide, summaryMarkdown, readEvent, label, safeRead, showAt, validRev, mdCell, FAIL_ON, Client };
+module.exports = { nonWaivable, mcpFingerprint, parseAllowAmbiguous, unknownClass, listFiles, resolveMode, ensureCommit, collect, check, decide, summaryMarkdown, readEvent, label, safeRead, showAt, validRev, mdCell, FAIL_ON, Client };

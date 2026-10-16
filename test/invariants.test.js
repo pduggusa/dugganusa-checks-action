@@ -154,7 +154,7 @@ test('finding 9: settings.json MCP blocks, any *.mcp.json, packageManager, requi
   const flat = p.fromMcpConfig('{ "mcp.servers": { "s": { "command": "./x" } } }');
   assert.ok(ambiguous(flat, /^s /));
   const gem = p.fromMcpConfig('{ "mcpServers": { "g": { "command": "uvx", "args": ["mcp-server-git"], "cwd": "./evil" } } }');
-  assert.ok(ambiguous(gem, /option "cwd"/));
+  assert.ok(ambiguous(gem, /option\(s\) "cwd"/));
   for (const pm of ['yarn@https://evil.example/yarn.js', 'evil-pm@1.0.0', 'pnpm@latest', 'npm@^10']) {
     assert.ok(ambiguous(p.fromPackageJson(JSON.stringify({ packageManager: pm })), /corepack/), pm);
   }
@@ -353,4 +353,66 @@ test('control regression: two entries with the same key under different containe
   const items = run.collect({ cwd: dir, mode: 'full', base: null, includeTransitive: 'false', checkMcp: true }).items.filter(i => i.cls === 'ambiguous');
   assert.equal(items.length, 2);
   assert.notEqual(items[0].fingerprint, items[1].fingerprint);
+});
+
+// ---- owner gate binds launcher context; only entry_shape is waivable --------------------------
+
+const FS_ENTRY = { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/srv/data'] };
+const coll = (dir, allowAmbiguous) => run.collect({ cwd: dir, mode: 'full', base: null, includeTransitive: 'false', checkMcp: true, ...(allowAmbiguous ? { allowAmbiguous } : {}) });
+const fpOf = (dir) => coll(dir).items.find(i => i.fingerprint).fingerprint;
+const gated = (dir, fpr) => coll(dir, new Set([fpr]));
+const addCommit = (dir, files) => { for (const [f, c] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), c); } execFileSync('git', ['add', '-A'], { cwd: dir }); execFileSync('git', ['commit', '-qm', 'ctx'], { cwd: dir }); };
+const allowedIn = (res) => res.items.some(i => i.owner_allowed);
+
+test('owner gate: approved entry with only entry_shape and unchanged context is allowed', () => {
+  const dir = gitRepo({ '.mcp.json': JSON.stringify({ mcpServers: { filesystem: FS_ENTRY } }) });
+  const r = gated(dir, fpOf(dir));
+  assert.ok(allowedIn(r));
+  assert.deepEqual(r.items.find(i => i.owner_allowed).reasons, ['entry_shape']);
+});
+
+test('owner gate: approved entry + a new .npmrc registry redirect fails', () => {
+  const dir = gitRepo({ '.mcp.json': JSON.stringify({ mcpServers: { filesystem: FS_ENTRY } }) });
+  const fpr = fpOf(dir);
+  addCommit(dir, { '.npmrc': 'registry=https://evil.example/\n' });
+  const r = gated(dir, fpr);
+  assert.ok(!allowedIn(r));
+  assert.ok(r.items.some(i => i.cls === 'ambiguous' && i.reasons.includes('registry_redirect')));
+  const r2 = gated(dir, fpOf(dir)); // even a fresh approval cannot waive registry_redirect
+  assert.ok(!allowedIn(r2));
+  assert.ok(r2.notes.some(n => /NOT applied: non-waivable reason\(s\) registry_redirect/.test(n.text)));
+});
+
+test('owner gate: approved entry + a top-level env added fails', () => {
+  const dir = gitRepo({ '.claude/settings.json': JSON.stringify({ mcpServers: { filesystem: FS_ENTRY } }) });
+  const fpr = fpOf(dir);
+  addCommit(dir, { '.claude/settings.json': JSON.stringify({ env: { PATH: './evilbin' }, mcpServers: { filesystem: FS_ENTRY } }) });
+  assert.ok(!allowedIn(gated(dir, fpr)));
+  assert.ok(!allowedIn(gated(dir, fpOf(dir))), 'inherited_env is non-waivable even with a fresh approval');
+});
+
+test('owner gate: approved entry + a local bin added fails; any context change re-triggers', () => {
+  const dir = gitRepo({ 'package.json': JSON.stringify({ name: 'app' }), '.mcp.json': JSON.stringify({ mcpServers: { filesystem: FS_ENTRY } }) });
+  const fpr = fpOf(dir);
+  addCommit(dir, { 'package.json': JSON.stringify({ name: 'app', bin: { 'server-filesystem': 'evil.js' } }) });
+  const r = gated(dir, fpr);
+  assert.ok(!allowedIn(r));
+  assert.ok(r.items.some(i => i.reasons && i.reasons.includes('local_bin_shadow')));
+  const d2 = gitRepo({ 'package.json': JSON.stringify({ name: 'app' }), '.mcp.json': JSON.stringify({ mcpServers: { filesystem: FS_ENTRY } }) });
+  const f2 = fpOf(d2);
+  addCommit(d2, { 'package.json': JSON.stringify({ name: 'app', dependencies: { lodash: '4.17.21' } }) });
+  assert.notEqual(fpOf(d2), f2, 'the context digest is bound into the fingerprint');
+});
+
+test('owner gate: every reason must be waivable; unknown or future reason codes are non-waivable', () => {
+  assert.deepEqual([...p.WAIVABLE], ['entry_shape']);
+  const dir = gitRepo({ '.mcp.json': JSON.stringify({ mcpServers: { filesystem: { ...FS_ENTRY, env: { PATH: './x' } }, sh: { command: 'npx', args: ['-y', '-p', 'x', 'y'] } } }) });
+  const fps = new Set(coll(dir).items.filter(i => i.fingerprint).map(i => i.fingerprint));
+  assert.equal(fps.size, 2);
+  assert.ok(!allowedIn(coll(dir, fps)), 'entry_shape + entry_env, and launcher_option, are not waived');
+  // the gate predicate itself: allow-by-code, so a code nobody has written yet is refused
+  assert.deepEqual(run.nonWaivable(['entry_shape']), []);
+  assert.deepEqual(run.nonWaivable(['entry_shape', 'some_future_code']), ['some_future_code']);
+  assert.deepEqual(run.nonWaivable([]), ['other'], 'no recorded reason is not a waivable reason');
+  assert.deepEqual(run.nonWaivable(undefined), ['other']);
 });

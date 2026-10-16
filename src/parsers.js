@@ -881,6 +881,18 @@ function canonicalJson(v) {
   return JSON.stringify(v === undefined ? null : v);
 }
 
+// Reason codes on ambiguous MCP entries. The owner gate (allow-ambiguous) may waive ONLY codes in
+// WAIVABLE; every other code, including any code added later, is non-waivable by construction.
+//   entry_shape      npx/uvx extra arguments after a canonical package (the only waivable code)
+//   launcher_option  launcher flags, docker options/commands, or a package spec that is not plain
+//   entry_command    command is not exactly npx/uvx/docker
+//   entry_option     entry keys beyond the canonical set (cwd, envFile, ...)
+//   entry_env        the entry's env re-points the launcher
+//   inherited_env    a top-level env in the file re-points the launcher
+//   registry_redirect / local_bin_shadow  repository context (added in run.js)
+//   other            anything else
+const WAIVABLE = new Set(['entry_shape']);
+
 function fromMcpConfig(text) {
   const m = new Map();
   const { value: j, duplicates } = parseJson(text, { jsonc: true });
@@ -895,44 +907,55 @@ function fromMcpConfig(text) {
   }
   for (const [key, cfg, where] of mcpEntries(j)) {
     const fp = canonicalJson({ where, entry: cfg, fileEnv: isObj(j) && j.env !== undefined ? j.env : null });
-    let candidate = null;
-    const say = (reason) => put(m, { ...unknown(key, `MCP server "${key}": ${reason}`), where, mcpEntry: true, fp, ...(candidate ? { candidate } : {}) });
-    if (!isObj(cfg)) { say('entry is not an object'); continue; }
+    // Every reason is collected (not just the first), so the gate can require ALL to be waivable.
+    const problems = [];
+    const add = (code, text) => problems.push({ code, text });
+    const emit = (extra = {}) => put(m, { ...unknown(key, `MCP server "${key}": ${problems.map(x => x.text).join('; ')}`), reasons: [...new Set(problems.map(x => x.code))], where, mcpEntry: true, fp, ...extra });
+    if (!isObj(cfg)) { add('other', 'entry is not an object'); emit(); continue; }
     const remoteUrl = cfg.url !== undefined ? cfg.url : cfg.serverUrl !== undefined ? cfg.serverUrl : cfg.httpUrl;
     const isRemote = remoteUrl !== undefined || ['sse', 'http', 'streamable-http'].includes(cfg.type);
-    if (isRemote && cfg.command !== undefined) { say('has both a command and a URL: which one a client uses is client-specific'); continue; }
+    if (isRemote && cfg.command !== undefined) { add('other', 'has both a command and a URL: which one a client uses is client-specific'); emit(); continue; }
     if (isRemote) {
       const extra = Object.keys(cfg).find(k => !MCP_REMOTE_KEYS.has(k));
-      if (extra) { say(`remote entry has option "${extra.slice(0, 40)}", which is not part of the canonical form`); continue; }
+      if (extra) add('entry_option', `remote entry has option "${extra.slice(0, 40)}", which is not part of the canonical form`);
       const urls = ['url', 'serverUrl', 'httpUrl'].filter(k => cfg[k] !== undefined);
-      if (urls.length !== 1 || typeof remoteUrl !== 'string') { say('remote entry must have exactly one URL string'); continue; }
-      let host;
-      try { const u = new URL(remoteUrl); if (!/^https?:$/.test(u.protocol)) throw new Error(); host = u.host; } catch { say('remote URL does not parse'); continue; }
+      let host = null;
+      if (urls.length !== 1 || typeof remoteUrl !== 'string') add('other', 'remote entry must have exactly one URL string');
+      else { try { const u = new URL(remoteUrl); if (!/^https?:$/.test(u.protocol)) throw new Error(); host = u.host; } catch { add('other', 'remote URL does not parse'); } }
+      if (problems.length) { emit(); continue; }
       put(m, notInCorpus(key, `MCP server "${key}": remote server at ${host}; no package identity to judge, and its config key is not an identity`));
       continue;
     }
-    const extra = Object.keys(cfg).find(k => !MCP_LOCAL_KEYS.has(k));
-    if (extra) { say(`option "${extra.slice(0, 40)}" is not part of the canonical form (cwd, envFile and the like change what runs)`); continue; }
-    if (cfg.type !== undefined && cfg.type !== 'stdio') { say(`type "${String(cfg.type).slice(0, 20)}" is not stdio`); continue; }
-    if (typeof cfg.command !== 'string' || !cfg.command) { say('no command'); continue; }
-    if (cfg.args !== undefined && (!Array.isArray(cfg.args) || cfg.args.some(a => typeof a !== 'string'))) { say('args is not an array of strings'); continue; }
+    const extra = Object.keys(cfg).filter(k => !MCP_LOCAL_KEYS.has(k));
+    if (extra.length) add('entry_option', `option(s) ${extra.map(k => `"${k.slice(0, 40)}"`).join(', ')} not part of the canonical form (cwd, envFile and the like change what runs)`);
+    if (cfg.type !== undefined && cfg.type !== 'stdio') add('other', `type "${String(cfg.type).slice(0, 20)}" is not stdio`);
+    const cmdOk = typeof cfg.command === 'string' && cfg.command;
+    if (!cmdOk) add('other', 'no command');
+    const argsOk = cfg.args === undefined || (Array.isArray(cfg.args) && cfg.args.every(a => typeof a === 'string'));
+    if (!argsOk) add('other', 'args is not an array of strings');
     if (cfg.env !== undefined) {
-      if (!isObj(cfg.env)) { say('env is not an object'); continue; }
-      const bad = Object.keys(cfg.env).find(k => !ENV_NAME.test(k) || ENV_FORBIDDEN.test(k));
-      if (bad) { say(`env ${bad.slice(0, 40)} changes which binary, package, registry or loader runs`); continue; }
+      if (!isObj(cfg.env)) add('entry_env', 'env is not an object');
+      else { const bad = Object.keys(cfg.env).find(k => !ENV_NAME.test(k) || ENV_FORBIDDEN.test(k)); if (bad) add('entry_env', `env ${bad.slice(0, 40)} changes which binary, package, registry or loader runs`); }
     }
-    const args = cfg.args || [];
-    // The package a non-canonical npx/uvx line would most likely fetch: checked only if the owner
-    // gate honors this exact entry, so a BLOCK on it still fails the job.
-    if (cfg.command === 'npx' || cfg.command === 'uvx') {
-      const pre = cfg.command === 'npx' ? (args[0] === '-y' ? args.slice(1) : args) : args;
-      if (pre.length > 1 && !pre[0].startsWith('-')) { const c = canonicalLaunch(cfg.command, [pre[0]]); if (!c.problem && c.packages[0]) candidate = { ...c.packages[0], via: `mcp:${key}` }; }
+    if (fileEnvBad) add('inherited_env', 'the file sets a top-level env that re-points launchers');
+    const args = argsOk ? (cfg.args || []) : [];
+    const launcher = ['npx', 'uvx', 'docker'].includes(cfg.command) ? cfg.command : null;
+    let candidate = null; let launch = null;
+    if (cmdOk && argsOk) {
+      launch = canonicalLaunch(cfg.command, args);
+      if (launch.problem) {
+        // The only waivable shape: npx [-y] <plain package> <extra args> / uvx <plain package> <extra args>.
+        // The package is then still checked, if the owner gate honors the entry.
+        const pre = cfg.command === 'npx' ? (args[0] === '-y' ? args.slice(1) : args) : cfg.command === 'uvx' ? args : null;
+        const c = pre && pre.length > 1 && !pre[0].startsWith('-') ? canonicalLaunch(cfg.command, [pre[0]]) : null;
+        if (c && !c.problem) { candidate = { ...c.packages[0], via: `mcp:${key}` }; add('entry_shape', `${pre.length - 1} argument(s) after the package ${c.server} are handed to whatever it runs`); }
+        else add(launcher ? 'launcher_option' : 'entry_command', launch.problem);
+      }
     }
-    if (fileEnvBad) { say('the file sets a top-level env that re-points launchers'); continue; }
-    const launch = canonicalLaunch(cfg.command, args);
-    if (launch.problem) { say(launch.problem); continue; }
+    const launchName = launch && !launch.problem ? launch.server : candidate ? candidate.name : null;
+    if (problems.length) { emit({ launcher, launchName, ...(candidate ? { candidate } : {}) }); continue; }
     for (const p of launch.packages) put(m, { ...p, via: `mcp:${key}` });
-    put(m, { kind: 'mcp', key, where, server: launch.server, version: launch.version, via: launch.via, fp });
+    put(m, { kind: 'mcp', key, where, server: launch.server, version: launch.version, via: launch.via, fp, launcher, launchName });
   }
   return m;
 }
@@ -1063,5 +1086,5 @@ module.exports = {
   EXACT_SEMVER, pep503, pkgKey, manifestKind, parseNpmSpec, npmFromRange, parsePipSpec, parse, diffItems, decode,
   pipLogicalLines, npmRegistryIdentity,
   fromPackageJson, fromPackageLock, fromRequirements, fromPyproject, fromPoetryLock, fromGemfile, fromGemfileLock, fromMcpConfig,
-  canonicalLaunch, localNpmNames, lockfileNpmNames, unknown, notInCorpus,
+  canonicalLaunch, localNpmNames, lockfileNpmNames, unknown, WAIVABLE, notInCorpus,
 };
