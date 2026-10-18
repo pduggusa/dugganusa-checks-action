@@ -62,6 +62,8 @@ function manifestKind(file) {
   if (b === 'mcp.json' || /\.mcp\.json$/i.test(b) || b === 'claude_desktop_config.json') return 'mcp';
   if (/(^|\/)\.claude\/settings(\.local)?\.json$/.test(f)) return 'mcp';
   if (/(^|\/)\.(vscode|gemini|cursor)\/settings\.json$/.test(f)) return 'mcp';
+  // Agent instruction files (2026-10-18): prompt delivered through the agent's own config.
+  if (require('./instructions').isInstructionFile(f)) return 'instructions';
   // GitHub Actions workflows and composite actions (2026-10-18): every `uses:` step is a dependency
   // that runs with the workflow's token and secrets (tj-actions/changed-files, 2025).
   if (/(^|\/)\.github\/workflows\/[^/]+\.ya?ml$/i.test(f)) return 'workflow';
@@ -1102,6 +1104,7 @@ function parse(kind, text, opts = {}) {
     case 'gemfile.lock': return fromGemfileLock(text);
     case 'mcp': return fromMcpConfig(text);
     case 'workflow': return fromWorkflow(text);
+    case 'instructions': return require('./instructions').fromInstructions(text);
     case 'unsupported': return fromUnsupported(text, opts);
     case 'install-config': return fromInstallConfig(text, opts);
     default: return new Map();

@@ -172,7 +172,7 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter, all
     it.line = lineOf(text, it.kind === 'mcp' ? it.key : it.name);
     // MCP skips are keyed by their container path too: two entries named "fs" under different
     // containers are two findings (else an owner-allowed one could stand in for the other).
-    const k = it.kind === 'package' ? parsers.pkgKey(it.ecosystem, it.name, it.version) : it.kind === 'mcp' ? `mcp:${it.server}@${it.version || ''}` : `skip:${f}:${it.where ? it.where + ':' : ''}${it.spec}`;
+    const k = it.kind === 'package' ? parsers.pkgKey(it.ecosystem, it.name, it.version) : it.kind === 'mcp' ? `mcp:${it.server}@${it.version || ''}` : it.kind === 'finding' ? `finding:${f}:${it.spec}` : `skip:${f}:${it.where ? it.where + ':' : ''}${it.spec}`;
     const prev = byKey.get(k);
     // an ambiguous finding is never hidden behind an earlier, milder item with the same key
     if (prev && !(it.kind === 'skip' && it.cls === 'ambiguous' && prev.cls !== 'ambiguous')) { if (!prev.files.includes(f)) prev.files.push(f); return; }
@@ -293,17 +293,19 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter, all
 
 function label(i) {
   if (i.kind === 'mcp') return `${i.key}${i.server !== i.key ? ` → ${i.server}` : ''}`;
-  if (i.kind === 'skip') return i.spec;
+  if (i.kind === 'skip' || i.kind === 'finding') return i.spec;
   return i.name;
 }
 
 async function check(items, client, { maxLookups, log }) {
   // Priority under the lookup cap: MCP servers, then direct deps, then transitive ones.
-  const prio = (i) => (i.kind === 'mcp' ? 0 : i.kind === 'skip' ? 3 : i.transitive ? 2 : 1);
+  const prio = (i) => (i.kind === 'finding' ? -1 : i.kind === 'mcp' ? 0 : i.kind === 'skip' ? 3 : i.transitive ? 2 : 1);
   const sorted = [...items].sort((a, b) => prio(a) - prio(b));
   let used = 0;
   const results = [];
   const work = sorted.map(async (i) => {
+    // Local findings (agent instruction files) carry their own verdict; no API call.
+    if (i.kind === 'finding') return { item: i, verdict: i.verdict, reason: i.reason, evidence: [] };
     if (i.kind === 'skip') return { item: i, verdict: 'UNKNOWN', unknown_class: i.cls === 'not_in_corpus' ? 'not_in_corpus' : 'ambiguous', owner_allowed: i.owner_allowed ? i.fingerprint : null, reason: `not checked: ${i.reason}`, evidence: i.fingerprint ? [i.fingerprint] : [] };
     // a count limit is attacker-reachable (pad the PR), so what it cuts off fails by default (unchecked)
     if (used >= maxLookups) return { item: i, verdict: 'UNKNOWN', unknown_class: 'unchecked', reason: `not checked: lookup cap (max-lookups=${maxLookups}) reached`, evidence: [] };
@@ -381,7 +383,7 @@ function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, fai
     const sorted = [...results].sort((a, b) => ORDER[a.verdict] - ORDER[b.verdict] || label(a.item).localeCompare(label(b.item)));
     for (const r of sorted) {
       const i = r.item;
-      const type = i.kind === 'mcp' ? 'MCP server' : i.kind === 'skip' ? 'source' : `${i.ecosystem}${i.transitive ? ' (transitive)' : ''}`;
+      const type = i.kind === 'mcp' ? 'MCP server' : i.kind === 'finding' ? 'agent instructions' : i.kind === 'skip' ? 'source' : `${i.ecosystem}${i.transitive ? ' (transitive)' : ''}`;
       L.push(`| ${icon(r)} | ${type} | <code>${mdCell(label(i))}</code> | ${mdCell(i.version || '—')} | ${mdCell(i.files.join(', '))} | ${mdCell(r.reason)} | ${mdCell((r.evidence || []).join(', ') || '—')} |`);
     }
   } else {
