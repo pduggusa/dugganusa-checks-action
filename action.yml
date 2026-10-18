@@ -1,5 +1,5 @@
 name: DugganUSA Checks
-description: Checks new dependencies and MCP servers in pull requests for malicious packages, known vulns and unknown servers.
+description: Checks new dependencies, GitHub Actions, MCP servers and agent instruction files in pull requests for malicious packages, known vulns, unknown servers and hidden instructions.
 author: DugganUSA LLC
 branding:
   icon: shield
