@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 (2026-10-18)
+
+- `action.yml` description shortened to fit the GitHub Marketplace limit (125 characters). No behavior change.
+- User-Agent is now `dugganusa-checks-action/1.1.1`.
+
 ## 1.1.0 (2026-10-18)
 
 - **GitHub Actions are dependencies.** Workflows (`.github/workflows/*.yml`) and composite actions (`action.yml`) are read; each `uses: owner/repo@ref` is checked through check-package's new `github-actions` ecosystem. OSV does not evaluate version ranges for GitHub Actions, so the API evaluates them itself. A full-SHA pin is REVIEW when the action has published advisories (the 2025 tj-actions/changed-files compromise was malicious commits); floating `vX`/`vX.Y` tags are REVIEW; branch refs and `${{ }}` expressions are UNKNOWN, never skipped.

@@ -1,5 +1,5 @@
 name: DugganUSA Checks
-description: Checks new dependencies, GitHub Actions, MCP servers and agent instruction files in pull requests for malicious packages, known vulns, unknown servers and hidden instructions.
+description: Pre-merge checks for malicious packages, risky GitHub Actions, MCP servers and hidden text in agent instruction files.
 author: DugganUSA LLC
 branding:
   icon: shield
