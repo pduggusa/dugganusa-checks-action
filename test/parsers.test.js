@@ -173,3 +173,33 @@ test('diffItems: only added or changed entries', () => {
   assert.equal(bad.items.length, 1);
   assert.ok(bad.items[0].kind === 'skip' && bad.items[0].unverifiable);
 });
+
+test('workflows: every uses: is a dependency; pinned, versioned, floating, branch, local, docker, expression', () => {
+  assert.equal(p.manifestKind('.github/workflows/ci.yml'), 'workflow');
+  assert.equal(p.manifestKind('.github/workflows/release.yaml'), 'workflow');
+  assert.equal(p.manifestKind('sub/action.yml'), 'workflow');
+  assert.equal(p.manifestKind('docs/notes.yml'), null);
+  const items = [...p.fromWorkflow([
+    'jobs:', '  a:', '    steps:',
+    '      - uses: tj-actions/changed-files@v45.0.7',
+    '      - uses: "github/codeql-action/init@a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" # pinned',
+    '      - uses: actions/checkout@v4',
+    '      - uses: some/action@main',
+    '      - uses: ./local-action',
+    '      - uses: docker://alpine:3',
+    '      - uses: ${{ matrix.action }}',
+    '      - run: echo uses: fake@v1',
+  ].join('\n')).values()];
+  const pkgs = items.filter(i => i.kind === 'package');
+  assert.deepEqual(pkgs.map(i => `${i.ecosystem} ${i.name}@${i.version}`), [
+    'github-actions tj-actions/changed-files@v45.0.7',
+    'github-actions github/codeql-action@a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0',
+    'github-actions actions/checkout@v4',
+  ]);
+  const skips = items.filter(i => i.kind === 'skip');
+  assert.ok(skips.some(s => s.cls === 'not_in_corpus' && /branch/.test(s.reason)), 'branch ref reported');
+  assert.ok(skips.some(s => s.cls === 'workspace' && /local action/.test(s.reason)), 'local noted');
+  assert.ok(skips.some(s => /container image/.test(s.reason)), 'docker noted');
+  assert.ok(skips.some(s => s.cls === 'ambiguous' && /expression/.test(s.reason)), 'expression reported, never skipped');
+  assert.ok(!items.some(i => String(i.spec || i.name).includes('fake')), 'a uses: inside a run: line is not a step');
+});

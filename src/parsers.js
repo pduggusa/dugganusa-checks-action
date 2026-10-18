@@ -62,6 +62,10 @@ function manifestKind(file) {
   if (b === 'mcp.json' || /\.mcp\.json$/i.test(b) || b === 'claude_desktop_config.json') return 'mcp';
   if (/(^|\/)\.claude\/settings(\.local)?\.json$/.test(f)) return 'mcp';
   if (/(^|\/)\.(vscode|gemini|cursor)\/settings\.json$/.test(f)) return 'mcp';
+  // GitHub Actions workflows and composite actions (2026-10-18): every `uses:` step is a dependency
+  // that runs with the workflow's token and secrets (tj-actions/changed-files, 2025).
+  if (/(^|\/)\.github\/workflows\/[^/]+\.ya?ml$/i.test(f)) return 'workflow';
+  if (b === 'action.yml' || b === 'action.yaml') return 'workflow';
   // Files that change WHAT an installer fetches but that we do not resolve: reported, never ignored.
   if (UNSUPPORTED.has(b)) return 'unsupported';
   if (INSTALL_CONFIG.has(b) || /(^|\/)\.bundle\/config$/.test(f)) return 'install-config';
@@ -1044,6 +1048,49 @@ function fromInstallConfig(text, { file = '' } = {}) {
   return m;
 }
 
+// `uses:` references in a workflow or composite action. Line-based on purpose: a `uses:` value is a
+// single scalar, and a YAML parser would add a dependency to a security check for no gain.
+//   owner/repo[/path]@<40-hex sha>  -> pinned package (immutable)
+//   owner/repo[/path]@v1.2.3 | 1.2   -> package at that version (ranges evaluated server-side)
+//   owner/repo[/path]@v4             -> floating major tag (the API says review: pin a SHA)
+//   owner/repo[/path]@main | other   -> branch ref: moves under you, reported as not_in_corpus
+//   ./local, docker://image          -> not a registry action, noted
+//   ${{ ... }} anywhere              -> unresolvable statically, ambiguous
+function fromWorkflow(text) {
+  const m = new Map();
+  const lines = String(text).split(/\r?\n/);
+  lines.forEach((line, i) => {
+    const where0 = `line ${i + 1}`;
+    // An expression anywhere in a uses: value is reported, never skipped (a dynamic target is
+    // exactly what an attacker would hide behind).
+    if (/^\s*(?:-\s*)?uses\s*:/.test(line) && /\$\{\{/.test(line)) {
+      const v = line.replace(/^\s*(?:-\s*)?uses\s*:\s*/, '').trim();
+      m.set(`skip:uses:${v}:${where0}`, { ...unknown(v, 'uses: is an expression; what it resolves to cannot be checked statically'), where: where0 });
+      return;
+    }
+    const mm = /^\s*(?:-\s*)?uses\s*:\s*(['"]?)([^'"#\s]+)\1\s*(?:#.*)?$/.exec(line);
+    if (!mm) {
+      if (/^\s*(?:-\s*)?uses\s*:/.test(line)) m.set(`skip:uses:unparsed:${where0}`, { ...unknown(line.trim().slice(0, 120), 'uses: line not in a recognized form; not checked'), where: where0 });
+      return;
+    }
+    const ref = mm[2];
+    const where = `line ${i + 1}`;
+    if (/\$\{\{/.test(ref)) { m.set(`skip:uses:${ref}:${where}`, { ...unknown(ref, 'uses: is an expression; what it resolves to cannot be checked statically'), where }); return; }
+    if (ref.startsWith('./') || ref.startsWith('.\\')) { m.set(`skip:uses:${ref}`, { ...workspace(ref, 'local action in this repository'), where }); return; }
+    if (/^docker:\/\//i.test(ref)) { m.set(`skip:uses:${ref}`, { ...notInCorpus(ref, 'container image action: not checked by this action'), where }); return; }
+    const at = /^([A-Za-z0-9-_.]+)\/([A-Za-z0-9-_.]+)((?:\/[^@]*)?)@(.+)$/.exec(ref);
+    if (!at) { m.set(`skip:uses:${ref}`, { ...unknown(ref, 'uses: is not owner/repo@ref'), where }); return; }
+    const name = `${at[1]}/${at[2]}`;
+    const r = at[4];
+    if (/^[0-9a-f]{40}$/i.test(r) || /^v?\d+(\.\d+)*$/i.test(r)) {
+      put(m, { kind: 'package', ecosystem: 'github-actions', name, version: r, spec: ref, where });
+    } else {
+      m.set(`skip:uses:${ref}`, { ...notInCorpus(ref, `branch or non-version ref "${r}": it moves, so nothing pins what runs; pin a full commit SHA`), where });
+    }
+  });
+  return m;
+}
+
 function parse(kind, text, opts = {}) {
   switch (kind) {
     case 'package.json': return fromPackageJson(text);
@@ -1054,6 +1101,7 @@ function parse(kind, text, opts = {}) {
     case 'gemfile': return fromGemfile(text);
     case 'gemfile.lock': return fromGemfileLock(text);
     case 'mcp': return fromMcpConfig(text);
+    case 'workflow': return fromWorkflow(text);
     case 'unsupported': return fromUnsupported(text, opts);
     case 'install-config': return fromInstallConfig(text, opts);
     default: return new Map();
@@ -1084,7 +1132,7 @@ function diffItems(kind, beforeText, afterText, opts = {}, beforeOpts = opts) {
 
 module.exports = {
   EXACT_SEMVER, pep503, pkgKey, manifestKind, parseNpmSpec, npmFromRange, parsePipSpec, parse, diffItems, decode,
-  pipLogicalLines, npmRegistryIdentity,
+  pipLogicalLines, npmRegistryIdentity, fromWorkflow,
   fromPackageJson, fromPackageLock, fromRequirements, fromPyproject, fromPoetryLock, fromGemfile, fromGemfileLock, fromMcpConfig,
   canonicalLaunch, localNpmNames, lockfileNpmNames, unknown, WAIVABLE, notInCorpus,
 };
