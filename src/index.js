@@ -11,6 +11,9 @@ const { publicRepository } = require('./api');
 async function main() {
   const apiKey = gha.getInput('api-key');
   gha.mask(apiKey);
+  // 1.1.2: a keyless run says so where people look (the Checks annotation), with the one-step fix.
+  // Keyed runs are what make adoption countable, and a free key raises the anonymous limits.
+  if (!apiKey) gha.annotate('notice', 'Running without a DugganUSA API key, at anonymous limits. Already have a DugganUSA key (feed, API, MCP, Edge Shield)? It works here: add it as below. Otherwise a free key takes 30 seconds: https://analytics.dugganusa.com/stix/register?utm_source=github-action&utm_campaign=checks-keyless . Add it as the repository secret DUGGANUSA_API_KEY and pass api-key: ${{ secrets.DUGGANUSA_API_KEY }}.', { title: 'DugganUSA Checks: add a free key' });
   const failOn = gha.getInput('fail-on', 'block').toLowerCase();
   if (!run.FAIL_ON.includes(failOn)) throw new Error(`fail-on must be one of ${run.FAIL_ON.join(', ')}`);
   const failOnUnknown = gha.getBool('fail-on-unknown', false);

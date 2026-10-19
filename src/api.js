@@ -10,7 +10,7 @@
 
 const crypto = require('crypto');
 
-const VERSION = '1.1.1';
+const VERSION = '1.1.2';
 const USER_AGENT = `dugganusa-checks-action/${VERSION}`;
 
 // Strip control, zero-width, bidi and tag characters from API text before it reaches a log,

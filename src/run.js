@@ -398,7 +398,7 @@ function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, fai
     L.push('</details>');
   }
   L.push('');
-  L.push(`<sub>${client.calls} API call(s)${client.rateLimited ? `, ${client.rateLimited} rate-limited` : ''}, ${keyed ? 'keyed' : 'keyless (anonymous free rate; add an api-key secret for more)'}. ALLOW means no known evidence against it, not proof of safety. UNKNOWN means nothing was judged. Verdicts come from the public DugganUSA check-package and Dredd preflight APIs; treat them as one input, not a guarantee.</sub>`);
+  L.push(`<sub>${client.calls} API call(s)${client.rateLimited ? `, ${client.rateLimited} rate-limited` : ''}, ${keyed ? 'keyed' : 'keyless (anonymous limits). Use your existing DugganUSA key, or get a free one: https://analytics.dugganusa.com/stix/register?utm_source=github-action&utm_campaign=checks-keyless , then add it as the DUGGANUSA_API_KEY secret'}. ALLOW means no known evidence against it, not proof of safety. UNKNOWN means nothing was judged. Verdicts come from the public DugganUSA check-package and Dredd preflight APIs; treat them as one input, not a guarantee.</sub>`);
   return L.join('\n');
 }
 

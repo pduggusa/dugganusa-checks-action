@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.2 - 2026-10-19
+
+- A keyless run now shows a notice annotation and a summary link to a free API key, with the secret name to add. Nothing else changes: keyless runs still work at anonymous limits.
+- README quickstart starts with the key: reuse an existing DugganUSA key (feed, API, MCP, Edge Shield; it's the same key), or get a free one.
+
 ## 1.1.1 (2026-10-18)
 
 - `action.yml` description shortened to fit the GitHub Marketplace limit (125 characters). No behavior change.

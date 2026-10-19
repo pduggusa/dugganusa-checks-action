@@ -11,6 +11,10 @@ Threat intelligence you can check: every verdict in the job summary comes with t
 
 ## Quick start
 
+**1. Use your DugganUSA API key.** Already have one from the feed, the API, the MCP servers or Edge Shield? It's the same key: use it. If not, get a free one (30 seconds): [analytics.dugganusa.com/stix/register](https://analytics.dugganusa.com/stix/register?utm_source=github-action&utm_campaign=checks-readme). Add it to your repository as the secret `DUGGANUSA_API_KEY` (Settings, Secrets and variables, Actions). The action still runs without one, at anonymous limits.
+
+**2. Add the workflow:**
+
 ```yaml
 name: DugganUSA Checks
 on:
@@ -28,7 +32,7 @@ jobs:
           persist-credentials: false
       - uses: pduggusa/dugganusa-checks-action@v1
         with:
-          api-key: ${{ secrets.DUGGANUSA_API_KEY }}   # optional
+          api-key: ${{ secrets.DUGGANUSA_API_KEY }}   # free key, see step 1 above
 ```
 
 A fuller example with `paths:` filters is in [`examples/dugganusa-checks.yml`](examples/dugganusa-checks.yml).
@@ -107,7 +111,7 @@ Every ambiguous MCP entry prints its fingerprint in the summary's Evidence colum
 
 | Input | Default | |
 |---|---|---|
-| `api-key` | none | Optional DugganUSA API key. Pass it from a secret. Sent only as `Authorization: Bearer`, never in a URL, masked in logs. |
+| `api-key` | none | DugganUSA API key ([free](https://analytics.dugganusa.com/stix/register)). Optional, but keyless runs use anonymous limits. Pass it from a secret. Sent only as `Authorization: Bearer`, never in a URL, masked in logs. |
 | `fail-on` | `block` | `block`, `review` or `none` |
 | `fail-on-unknown` | `false` | Also fail on UNKNOWN: not in corpus |
 | `fail-on-ambiguous` | `true` | Fail on UNKNOWN: ambiguous (evasion-shaped) |

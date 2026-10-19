@@ -1,12 +1,16 @@
 {
   "name": "dugganusa-checks-action",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "description": "GitHub Action: pre-install membrane checks for dependencies and MCP servers on pull requests",
   "license": "MIT",
   "main": "src/index.js",
-  "engines": { "node": ">=20" },
-  "scripts": { "test": "node --test test/*.test.js" },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "dependencies": {},
   "devDependencies": {}
 }
