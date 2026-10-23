@@ -1,5 +1,7 @@
 # DugganUSA Checks
 
+**Docs:** https://docs.dugganusa.com/agents/checks-action/
+
 **We watched the open internet, then built the membrane between your AI agents and everything they install, call, read and obey.**
 
 This Action puts that membrane in your pull requests. When a PR adds or changes a dependency or an MCP server, it asks two public DugganUSA checks about it before anything gets merged and installed:
