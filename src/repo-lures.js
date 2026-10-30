@@ -62,24 +62,25 @@ const BENIGN_HOOK = /^(?:husky(?:\s+install)?|tsc(?:\s[\w .\-/=]*)?|node-gyp\s+r
 const SHELL_META = /[$`()<>|;&\n\r\\]/;
 
 // ONE command or string value at a time, clipped, so padding in front of a payload cannot hide it.
-function classify(cmd) {
-  const s = String(cmd).slice(0, CLIP);
+function classifyOne(s) {
   for (const [re, why] of STRONG) if (re.test(s)) return { level: 'strong', why };
   for (const [re, why] of WEAK) if (re.test(s)) return { level: 'weak', why };
   return null;
 }
-const worse = (a, b) => (!a ? b : !b ? a : (a.level === 'strong' || b.level !== 'strong') ? a : b);
-// Raw text (a file that would not parse): classified in overlapping 4,000-character windows, so padding cannot push
-// a payload past the clip. Linear: 200 KB is at most about 55 windows.
-function classifyText(text) {
+// A string longer than the clip is read in overlapping windows, so padding in front of a payload cannot hide it
+// (review of 2026-10-30). Linear: at most about 55 windows for a 200 KB file.
+function classify(cmd) {
+  const t = String(cmd);
+  if (t.length <= CLIP) return classifyOne(t);
   let best = null;
-  const t = String(text);
   for (let i = 0; i < t.length && i < MAX_BYTES_PER_FILE; i += CLIP - 300) {
-    best = worse(best, classify(t.slice(i, i + CLIP)));
+    best = worse(best, classifyOne(t.slice(i, i + CLIP)));
     if (best && best.level === 'strong') break;
   }
   return best;
 }
+const worse = (a, b) => (!a ? b : !b ? a : (a.level === 'strong' || b.level !== 'strong') ? a : b);
+const classifyText = classify;   // same windows, for raw text
 function classifyAll(strings) { let best = null; for (const s of strings) { best = worse(best, classify(s)); if (best && best.level === 'strong') break; } return best; }
 
 // "npm run build" is only as safe as scripts.build. Resolve up to three hops, bounded; flags and run-script are read.
@@ -115,30 +116,44 @@ function parseJsonc(text) {
   try { return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1')); } catch (_) { return null; }
 }
 // Strings under a node, bounded in count, depth and size.
+// Where a bound is hit the result carries truncated = true and the caller reports it: a walk that gave up is not a pass.
 function collectStrings(node, limit = 400) {
   const out = []; const stack = [[node, 0]]; let seen = 0;
-  while (stack.length && out.length < limit && seen++ < 5000) {
+  out.truncated = false;
+  while (stack.length) {
+    if (out.length >= limit || seen++ >= 5000) { out.truncated = true; break; }
     const [v, d] = stack.pop();
-    if (typeof v === 'string') out.push(v.slice(0, CLIP));
-    else if (d < 20 && Array.isArray(v)) { for (const x of v.slice(0, 200)) stack.push([x, d + 1]); }
-    else if (d < 20 && v && typeof v === 'object') { for (const x of Object.values(v).slice(0, 200)) stack.push([x, d + 1]); }
+    if (typeof v === 'string') out.push(v.slice(0, MAX_BYTES_PER_FILE));
+    else if (Array.isArray(v) || (v && typeof v === 'object')) {
+      if (d >= 20) { out.truncated = true; continue; }
+      const kids = Array.isArray(v) ? v : Object.values(v);
+      if (kids.length > 200) out.truncated = true;
+      for (const x of kids.slice(0, 200)) stack.push([x, d + 1]);
+    }
   }
   return out;
 }
 // Short digest of the text a finding rests on, so a pull request that CHANGES a command re-triggers the finding even when
 // its description is the same words (the Action diffs findings by identity).
-const digest = (strings) => crypto.createHash('sha256').update(strings.slice(0, 400).join('\n').slice(0, 20000)).digest('hex').slice(0, 12);
+const digest = (strings) => crypto.createHash('sha256').update(strings.join('\n')).digest('hex').slice(0, 12);
 // Every object in the tree that sets runOn to folderOpen (anywhere, not only under tasks), with the strings around it.
 function findRunOnOpen(doc) {
   const out = []; const stack = [[doc, null, 0]]; let seen = 0;
-  while (stack.length && seen++ < 5000) {
+  out.truncated = false;
+  while (stack.length) {
+    if (seen++ >= 5000) { out.truncated = true; break; }
     const [v, parent, d] = stack.pop();
-    if (!v || typeof v !== 'object' || d > 20) continue;
-    if (isObj(v) && ((isObj(v.runOptions) && v.runOptions.runOn === 'folderOpen') || v.runOn === 'folderOpen')) out.push(collectStrings(isObj(v.runOptions) ? v : (parent || v), 50));
-    for (const x of (Array.isArray(v) ? v : Object.values(v)).slice(0, 200)) stack.push([x, v, d + 1]);
+    if (!v || typeof v !== 'object') continue;
+    if (d > 20) { out.truncated = true; continue; }
+    if (isObj(v) && ((isObj(v.runOptions) && v.runOptions.runOn === 'folderOpen') || v.runOn === 'folderOpen')) { const cs = collectStrings(isObj(v.runOptions) ? v : (parent || v), 50); if (cs.truncated) out.truncated = true; out.push(cs); }
+    const kids = Array.isArray(v) ? v : Object.values(v);
+    if (kids.length > 200) out.truncated = true;
+    for (const x of kids.slice(0, 200)) stack.push([x, v, d + 1]);
   }
   return out;
 }
+// Raw text with JSON \\uXXXX escapes decoded, for the fallback rules on a file that would not parse.
+const rawDecoded = (t) => String(t).replace(/\\u([0-9a-f]{4})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
 const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 
 function scanRepo(files, opts = {}) {
@@ -149,14 +164,13 @@ function scanRepo(files, opts = {}) {
   let total = 0;
   const unread = [];
   let capped = false;
+  let findingsTruncated = false;
   const skipped = Array.isArray(opts.skipped) ? opts.skipped.slice(0, 50).map((x) => clip(x, 100)) : [];
   // Every field that reaches a terminal, a log or a summary is stripped of control, C1, bidi and line-break characters
   // here, once, whatever the rule interpolated into it (a dependency name, a hook name, a path).
-  const add = (f) => { if (result.findings.length < MAX_FINDINGS) result.findings.push({ ...f, digest: f.digest ? String(f.digest).slice(0, 16) : undefined, file: clip(f.file, 300), message: clip(f.message, 600), evidence: clip(f.evidence, 160), fix: clip(f.fix, 300) }); };
-  const room = () => result.findings.length < MAX_FINDINGS;
+  const add = (f) => { if (result.findings.length >= MAX_FINDINGS && f.verdict !== 'BLOCK' && f.rule !== 'RLS-000') { findingsTruncated = true; return; } result.findings.push({ ...f, digest: f.digest ? String(f.digest).slice(0, 16) : undefined, file: clip(f.file, 300), message: clip(f.message, 600), evidence: clip(f.evidence, 160), fix: clip(f.fix, 300) }); };
 
   for (const [rawPath, rawText] of entries) {
-    if (!room()) break;
     const path = norm(rawPath);
     const pathL = path.toLowerCase();
     const name = base(pathL);
@@ -178,27 +192,27 @@ function scanRepo(files, opts = {}) {
           if (typeof scripts[hook] !== 'string') continue;
           const cmd = scripts[hook];
           const k = classifyAll(expand(cmd, scripts));
-          const line = room() && result.findings.length < 25 ? lineOf(text, `"${hook}"`) : 0;
+          const line = result.findings.length < 25 ? lineOf(text, `"${hook}"`) : 0;
           if (k && k.level === 'strong') add({ rule: 'RLS-001', severity: 'critical', verdict: 'BLOCK', file: path, line, evidence: cmd, message: `The ${hook} script runs automatically on npm install and ${k.why}.`, fix: 'Do not install. Read what it fetches or evaluates first, on a machine with no credentials, and install with --ignore-scripts.' });
           else if (k) add({ rule: 'RLS-001', severity: 'high', verdict: 'REVIEW', file: path, line, evidence: cmd, message: `The ${hook} script runs automatically on npm install and ${k.why}.`, fix: 'Read it before installing. Use npm install --ignore-scripts to inspect first.' });
           else if (SHELL_META.test(cmd) || !BENIGN_HOOK.test(cmd.trim())) add({ rule: 'RLS-001', severity: 'medium', verdict: 'REVIEW', file: path, line, evidence: cmd, message: `The ${hook} script runs automatically on npm install. It does not match a known-ordinary command.`, fix: 'Read the script it runs before installing.' });
         }
         // Dependencies fetched from git or a URL: every field npm or pnpm resolves, bounded.
         const groups = [pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies, pkg.peerDependencies, pkg.overrides, pkg.resolutions, isObj(pkg.pnpm) ? pkg.pnpm.overrides : null];
-        let budget = 3000;
+        let budget = 3000; let gitDeps = 0; const sample = [];
         outer: for (const deps of groups) {
           if (!isObj(deps)) continue;
           for (const [dn, dv0] of Object.entries(deps)) {
-            if (--budget < 0 || !room()) break outer;
+            if (--budget < 0) { findingsTruncated = true; break outer; }
             const vals = typeof dv0 === 'string' ? [dv0] : isObj(dv0) ? Object.values(dv0).filter((x) => typeof x === 'string').slice(0, 20) : [];
             for (const dv of vals) {
-              if (/^(?:git\+|git:|github:|gitlab:|bitbucket:|https?:\/\/|file:|link:)/i.test(dv) || /^[\w.-]+\/[\w.-]+(?:#.*)?$/.test(dv)) {
-                add({ rule: 'RLS-006', severity: 'medium', verdict: 'REVIEW', file: path, line: result.findings.length < 25 ? lineOf(text, JSON.stringify(dn)) : 0, evidence: `${dn}: ${dv}`, message: `${dn} is fetched from a git or URL source, not the registry, and runs its own install scripts.`, fix: 'Open that source and read it, or replace it with a registry release.' });
-                break;
-              }
+              if (/^(?:git\+|git:|github:|gitlab:|bitbucket:|https?:\/\/|file:|link:)/i.test(dv) || /^[\w.-]+\/[\w.-]+(?:#.*)?$/.test(dv)) { gitDeps++; if (sample.length < 3) sample.push(`${dn}: ${dv}`); break; }
             }
           }
         }
+        // One finding per file, not one per dependency: 600 git dependencies are one thing to read, and a flood of them
+        // must never push a BLOCK out of the list.
+        if (gitDeps) add({ rule: 'RLS-006', severity: 'medium', verdict: 'REVIEW', file: path, line: lineOf(text, JSON.stringify(sample[0].split(': ')[0])), evidence: sample.join('; '), digest: digest(sample), message: `${gitDeps} dependenc${gitDeps === 1 ? 'y is' : 'ies are'} fetched from a git or URL source, not the registry, and run their own install scripts (first: ${sample[0].split(': ')[0]}).`, fix: 'Open each source and read it, or replace it with a registry release.' });
       }
       continue;
     }
@@ -215,9 +229,13 @@ function scanRepo(files, opts = {}) {
       if (doc) {
         const found = findRunOnOpen(doc);
         if (found.length) hits = found.flat();
-      } else if (/runOn/.test(text)) {
-        add({ rule: 'RLS-002', severity: 'high', verdict: 'REVIEW', file: path, line: lineOf(text, 'runOn'), evidence: 'unparsed tasks file', message: `${path} mentions runOn but could not be parsed, so it could not be checked for tasks that run when the folder opens.`, fix: 'Read it by hand before you open this folder in VS Code.' });
-        continue;
+        if (found.truncated) add({ rule: 'RLS-002', severity: 'high', verdict: 'REVIEW', file: path, line: 1, evidence: 'file too large to check fully', message: `${path} is too large or deeply nested to check fully for tasks that run when the folder opens.`, fix: 'Read it by hand before you open this folder in VS Code.' });
+        // The walk found nothing but the file says folderOpen somewhere (odd structure): never a pass.
+        else if (!hits && /folderopen/i.test(rawDecoded(text))) hits = [text];
+      } else {
+        // Will not parse. Whatever VS Code makes of it, we cannot, so it is never clean.
+        add({ rule: 'RLS-002', severity: 'high', verdict: 'REVIEW', file: path, line: 1, evidence: 'unparsed tasks file', message: `${path} could not be parsed, so it could not be checked for tasks that run when the folder opens.`, fix: 'Read it by hand before you open this folder in VS Code.' });
+        if (/folderopen/i.test(rawDecoded(text))) hits = [text]; else continue;
       }
       if (hits) {
         const k = classifyAll(hits);
@@ -229,23 +247,27 @@ function scanRepo(files, opts = {}) {
     // RLS-003: agent / editor hooks, helper commands and MCP servers
     if (/(^|\/)\.claude\/settings(?:\.local)?\.json$/.test(pathL) || /(^|\/)\.cursor\/(?:mcp|hooks)\.json$/.test(pathL) || /(^|\/)\.mcp\.json$/.test(pathL) || /(^|\/)\.vscode\/mcp\.json$/.test(pathL)) {
       const doc = parseJsonc(text);
-      let hookStrings = [], serverStrings = [], autoApprove = false;
+      let hookStrings = [], serverStrings = [], autoApprove = false, trunc = false;
+      const cs = (n, lim) => { const r = collectStrings(n, lim); if (r.truncated) trunc = true; return r; };
       if (isObj(doc)) {
-        if (doc.hooks !== undefined) hookStrings.push(...collectStrings(doc.hooks));
+        if (doc.hooks !== undefined) hookStrings.push(...cs(doc.hooks));
         // Commands the agent runs outside the hooks key: status line, credential and telemetry helpers.
-        if (isObj(doc.statusLine)) hookStrings.push(...collectStrings(doc.statusLine, 20));
-        for (const k of ['apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport', 'otelHeadersHelper']) if (typeof doc[k] === 'string') hookStrings.push(doc[k].slice(0, CLIP));
-        for (const k of ['mcpServers', 'servers']) if (doc[k] !== undefined) serverStrings.push(...collectStrings(doc[k]));
+        if (isObj(doc.statusLine)) hookStrings.push(...cs(doc.statusLine, 20));
+        for (const k of ['apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport', 'otelHeadersHelper']) if (typeof doc[k] === 'string') hookStrings.push(doc[k].slice(0, MAX_BYTES_PER_FILE));
+        for (const k of ['mcpServers', 'servers']) if (doc[k] !== undefined) serverStrings.push(...cs(doc[k]));
         autoApprove = doc.enableAllProjectMcpServers === true || doc.enabledMcpjsonServers !== undefined;
       } else {
-        // Would not parse: raw-text rules, never a pass.
-        if (/"hooks"\s*:|"statusLine"\s*:|"apiKeyHelper"\s*:|"awsAuthRefresh"\s*:|"awsCredentialExport"\s*:|"otelHeadersHelper"\s*:/.test(text)) hookStrings.push(text);
-        else if (/"(?:mcpServers|servers)"\s*:/.test(text)) serverStrings.push(text);
-        autoApprove = /"enableAllProjectMcpServers"\s*:\s*true|"enabledMcpjsonServers"\s*:/.test(text);
+        // Would not parse: raw-text rules on the escape-decoded text, and the file is REVIEW whatever they find.
+        const dec = rawDecoded(text);
+        add({ rule: 'RLS-003', severity: 'high', verdict: 'REVIEW', file: path, line: 1, evidence: 'unparsed config file', message: `${path} could not be parsed, so a hook or server command in it could not be told apart from text.`, fix: 'Read it by hand before you open the folder with an agent or editor.' });
+        if (/"hooks"\s*:|"statusLine"\s*:|"apiKeyHelper"\s*:|"awsAuthRefresh"\s*:|"awsCredentialExport"\s*:|"otelHeadersHelper"\s*:/.test(dec)) hookStrings.push(dec);
+        else if (/"(?:mcpServers|servers)"\s*:/.test(dec)) serverStrings.push(dec);
+        autoApprove = /"enableAllProjectMcpServers"\s*:\s*true|"enabledMcpjsonServers"\s*:/.test(dec);
       }
+      if (trunc) add({ rule: 'RLS-003', severity: 'high', verdict: 'REVIEW', file: path, line: 1, evidence: 'file too large to check fully', message: `${path} is too large or deeply nested to check fully for hooks and servers.`, fix: 'Read it by hand before you open the folder with an agent or editor.' });
       const hasHooks = hookStrings.length > 0, hasServers = serverStrings.length > 0;
       if (hasHooks || hasServers || autoApprove) {
-        const k = hookStrings.length === 1 && hookStrings[0] === text ? classifyText(text) : classifyAll([...hookStrings, ...serverStrings]);
+        const k = classifyAll([...hookStrings, ...serverStrings]);
         const kind = hasHooks ? 'a hook that runs a command when the agent starts or acts' : 'an MCP server that is started as a command';
         add({ digest: digest([...hookStrings, ...serverStrings, String(autoApprove)]), rule: 'RLS-003', severity: k && k.level === 'strong' ? 'critical' : 'high', verdict: k && k.level === 'strong' ? 'BLOCK' : 'REVIEW', file: path, line: lineOf(text, hasHooks ? 'hooks' : 'mcpServers') || 1, evidence: k ? k.why : (hasHooks ? 'hooks present' : 'servers present'), message: `${path} defines ${kind}${k ? ' and ' + k.why : ''}${autoApprove ? '; it also pre-approves project servers' : ''}. An agent opened in this folder may run it with your permissions.`, fix: 'Read it before you open the folder with an agent or editor. Delete it, or open the repo with project hooks and servers disabled.' });
       }
@@ -256,11 +278,17 @@ function scanRepo(files, opts = {}) {
     if (/(^|\/)\.devcontainer\/(?:[^/]+\/)?devcontainer\.json$/.test(pathL) || /(^|\/)\.devcontainer\.json$/.test(pathL)) {
       const doc = parseJsonc(text);
       const KEYS = ['initializeCommand', 'onCreateCommand', 'updateContentCommand', 'postCreateCommand', 'postStartCommand', 'postAttachCommand'];
-      let present = [], strings = [];
-      if (isObj(doc)) { for (const key of KEYS) if (doc[key] !== undefined) { present.push(key); strings.push(...collectStrings(doc[key], 50)); } }
-      else { for (const key of KEYS) if (new RegExp('"' + key + '"\\s*:').test(text)) present.push(key); if (present.length) strings = null; }
+      let present = [], strings = [], trunc = false;
+      if (isObj(doc)) { for (const key of KEYS) if (doc[key] !== undefined) { present.push(key); const r = collectStrings(doc[key], 50); if (r.truncated) trunc = true; strings.push(...r); } }
+      else {
+        const dec = rawDecoded(text);
+        add({ rule: 'RLS-004', severity: 'high', verdict: 'REVIEW', file: path, line: 1, evidence: 'unparsed config file', message: `${path} could not be parsed, so its lifecycle commands could not be checked.`, fix: 'Read it by hand before you open this folder in a dev container.' });
+        for (const key of KEYS) if (new RegExp('"' + key + '"\\s*:').test(dec)) present.push(key);
+        if (present.length) strings = null;
+      }
+      if (trunc) add({ rule: 'RLS-004', severity: 'high', verdict: 'REVIEW', file: path, line: 1, evidence: 'file too large to check fully', message: `${path} is too large or deeply nested to check its lifecycle commands fully.`, fix: 'Read it by hand before you open this folder in a dev container.' });
       if (present.length) {
-        const k = strings === null ? classifyText(text) : classifyAll(strings);
+        const k = strings === null ? classifyText(rawDecoded(text)) : classifyAll(strings);
         const host = present.includes('initializeCommand');
         add({ digest: digest(strings === null ? [text] : [...present, ...strings]), rule: 'RLS-004', severity: (k && k.level === 'strong') || host ? 'critical' : 'high', verdict: (k && k.level === 'strong') ? 'BLOCK' : 'REVIEW', file: path, line: lineOf(text, present[0]), evidence: k ? k.why : present[0], message: `${present[0]} runs when the dev container is created or opened${host ? ' (initializeCommand runs on your host machine, outside the container)' : ''}${k ? ' and ' + k.why : ''}.`, fix: 'Read the command before opening this folder in a dev container.' });
       }
@@ -319,6 +347,7 @@ function scanRepo(files, opts = {}) {
     }
   }
 
+  if (findingsTruncated) add({ rule: 'RLS-000', severity: 'medium', verdict: 'REVIEW', file: '(findings)', line: 0, evidence: '', message: `More than ${MAX_FINDINGS} findings were produced and the lower-severity ones were not listed. Every BLOCK is kept.`, fix: 'Treat the repository as untrusted and read it by hand.' });
   if (unread.length) add({ rule: 'RLS-000', severity: 'low', verdict: 'REVIEW', file: unread[0], line: 0, evidence: clip(unread.slice(0, 3).join(', '), 160), message: `${unread.length} file${unread.length === 1 ? ' is' : 's are'} larger than 200 KB and ${unread.length === 1 ? 'was' : 'were'} not read (minified bundles hide payloads as easily as they hide whitespace).`, fix: 'Check that you recognize each one, or read it by hand.' });
   // Anything the caller could not or would not read (symlinks, depth or count limits) is never a clean result.
   if (skipped.length) add({ rule: 'RLS-000', severity: 'medium', verdict: 'REVIEW', file: skipped[0], line: 0, evidence: clip(skipped.slice(0, 3).join('; '), 160), message: `${skipped.length} path${skipped.length === 1 ? ' was' : 's were'} skipped and not checked (symlinks, depth or file-count limits). A lure can sit behind any of them.`, fix: 'Look at the skipped paths yourself before you open the repository.' });
