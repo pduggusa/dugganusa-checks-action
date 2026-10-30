@@ -81,7 +81,18 @@ function classify(cmd) {
 }
 const worse = (a, b) => (!a ? b : !b ? a : (a.level === 'strong' || b.level !== 'strong') ? a : b);
 const classifyText = classify;   // same windows, for raw text
-function classifyAll(strings) { let best = null, used = 0; for (const s of strings) { used += s.length; if (used > 2 * MAX_BYTES_PER_FILE) break; best = worse(best, classify(s)); if (best && best.level === 'strong') break; } return best; }
+// Each distinct string once (nested matches repeat the same text), so the work is bounded by the file's size. If the budget is
+// still exhausted the answer moves toward REVIEW, never toward clean.
+function classifyAll(strings) {
+  let best = null, used = 0;
+  for (const s of new Set(strings)) {
+    used += s.length;
+    if (used > 2 * MAX_BYTES_PER_FILE) { return worse(best, { level: 'weak', why: 'has more text than could be checked fully' }); }
+    best = worse(best, classify(s));
+    if (best && best.level === 'strong') break;
+  }
+  return best;
+}
 
 // "npm run build" is only as safe as scripts.build. Resolve up to three hops, bounded; flags and run-script are read.
 function expand(cmd, scripts, depth = 0) {
@@ -135,12 +146,9 @@ function collectStrings(node, limit = 400) {
 }
 // Short digest of the text a finding rests on, so a pull request that CHANGES a command re-triggers the finding even when
 // its description is the same words (the Action diffs findings by identity).
-const DIGEST_BUDGET = 256 * 1024;
-const digest = (strings) => {
-  const h = crypto.createHash('sha256'); let used = 0;
-  for (const x of strings) { const str = String(x); h.update(str.length > DIGEST_BUDGET - used ? str.slice(0, Math.max(0, DIGEST_BUDGET - used)) : str); h.update('\n'); used += str.length + 1; if (used >= DIGEST_BUDGET) { h.update('[+' + strings.length + ']'); break; } }
-  return h.digest('hex').slice(0, 12);
-};
+// Hashes ALL the content the finding rests on, each distinct string once: the input is bounded by the size of the file it
+// came from (at most 200 KB), so no cap is needed and nothing is left out of the identity.
+const digest = (strings) => crypto.createHash('sha256').update([...new Set(strings.map(String))].join('\n')).digest('hex').slice(0, 12);
 // Every object in the tree that sets runOn to folderOpen (anywhere, not only under tasks), with the strings around it.
 function findRunOnOpen(doc) {
   const out = []; const stack = [[doc, null, 0]]; let seen = 0, collected = 0;
