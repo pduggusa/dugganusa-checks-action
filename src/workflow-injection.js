@@ -304,18 +304,26 @@ function analyzeWorkflow(text) {
     const KEYLINE = /^\s*(?:-\s+)?[\"']?([A-Za-z_][\w-]*)[\"']?\s*:/;
     const stack = [];   // [{ indent, key }]
     const dataLine = new Set();
-    const BLOCK_END = /:\s*(?:(?:![^\s]*|&[^\s]+)\s+)*[|>](?:\d[+-]?|[+-]\d?)?\s*(#.*)?$/;
-    let blockIndent = -1;   // lines deeper than this belong to a block scalar: text, never keys
+    // A key whose value is not empty (inline scalar, quoted scalar open across lines, block indicator, flow
+    // collection) cannot own child keys, so every deeper line is continuation text: never a key, never data.
+    // Lines are capped before any pattern runs (review round 6: an unanchored pattern was quadratic on a
+    // 180 KB line, 10 s on a public endpoint).
+    let blockIndent = -1;
     for (const r of live) {
       if (isBlank(r.raw)) continue;
       if (blockIndent >= 0 && r.indent > blockIndent) continue;
       blockIndent = -1;
-      while (stack.length && stack[stack.length - 1].indent >= r.indent) stack.pop();
+      const raw = r.raw.length > LINE_CAP ? r.raw.slice(0, LINE_CAP) : r.raw;
+      const km = KEYLINE.exec(raw);
+      const col = km ? raw.length - raw.replace(/^\s*(?:-\s+)?/, '').length : r.indent;
+      while (stack.length && stack[stack.length - 1].indent >= col) stack.pop();
       const parent = stack.length ? stack[stack.length - 1].key : '';
-      if ((PLAIN.test(r.raw) && (parent === 'env' || parent === 'with')) || IFLINE.test(r.raw)) dataLine.add(r.n);
-      if (BLOCK_END.test(r.raw)) blockIndent = r.indent;
-      const km = KEYLINE.exec(r.raw);
-      if (km) stack.push({ indent: r.indent, key: km[1] });
+      if ((PLAIN.test(raw) && (parent === 'env' || parent === 'with')) || IFLINE.test(raw)) dataLine.add(r.n);
+      if (km) {
+        const value = raw.slice(raw.indexOf(':', col) + 1).trim();
+        if (value !== '' && !value.startsWith('#')) blockIndent = col;
+        else stack.push({ indent: col, key: km[1] });
+      } else if (raw.replace(/^\s*-?\s*/, '') !== '') blockIndent = r.indent;   // a flow item or other non-key text owns its deeper lines
     }
     for (const r of live) {
       if (consumed.has(r.n) || dataLine.has(r.n)) continue;
