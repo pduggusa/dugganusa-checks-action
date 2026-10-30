@@ -73,7 +73,7 @@ function classify(cmd) {
   const t = String(cmd);
   if (t.length <= CLIP) return classifyOne(t);
   let best = null;
-  for (let i = 0; i < t.length && i < MAX_BYTES_PER_FILE; i += CLIP - 300) {
+  for (let i = 0; i < t.length && i < MAX_BYTES_PER_FILE; i += CLIP - 600) {   // overlap 600 > the longest STRONG match (about 320 characters)
     best = worse(best, classifyOne(t.slice(i, i + CLIP)));
     if (best && best.level === 'strong') break;
   }
@@ -81,7 +81,7 @@ function classify(cmd) {
 }
 const worse = (a, b) => (!a ? b : !b ? a : (a.level === 'strong' || b.level !== 'strong') ? a : b);
 const classifyText = classify;   // same windows, for raw text
-function classifyAll(strings) { let best = null; for (const s of strings) { best = worse(best, classify(s)); if (best && best.level === 'strong') break; } return best; }
+function classifyAll(strings) { let best = null, used = 0; for (const s of strings) { used += s.length; if (used > 2 * MAX_BYTES_PER_FILE) break; best = worse(best, classify(s)); if (best && best.level === 'strong') break; } return best; }
 
 // "npm run build" is only as safe as scripts.build. Resolve up to three hops, bounded; flags and run-script are read.
 function expand(cmd, scripts, depth = 0) {
@@ -135,17 +135,28 @@ function collectStrings(node, limit = 400) {
 }
 // Short digest of the text a finding rests on, so a pull request that CHANGES a command re-triggers the finding even when
 // its description is the same words (the Action diffs findings by identity).
-const digest = (strings) => crypto.createHash('sha256').update(strings.join('\n')).digest('hex').slice(0, 12);
+const DIGEST_BUDGET = 256 * 1024;
+const digest = (strings) => {
+  const h = crypto.createHash('sha256'); let used = 0;
+  for (const x of strings) { const str = String(x); h.update(str.length > DIGEST_BUDGET - used ? str.slice(0, Math.max(0, DIGEST_BUDGET - used)) : str); h.update('\n'); used += str.length + 1; if (used >= DIGEST_BUDGET) { h.update('[+' + strings.length + ']'); break; } }
+  return h.digest('hex').slice(0, 12);
+};
 // Every object in the tree that sets runOn to folderOpen (anywhere, not only under tasks), with the strings around it.
 function findRunOnOpen(doc) {
-  const out = []; const stack = [[doc, null, 0]]; let seen = 0;
+  const out = []; const stack = [[doc, null, 0]]; let seen = 0, collected = 0;
   out.truncated = false;
   while (stack.length) {
     if (seen++ >= 5000) { out.truncated = true; break; }
     const [v, parent, d] = stack.pop();
     if (!v || typeof v !== 'object') continue;
     if (d > 20) { out.truncated = true; continue; }
-    if (isObj(v) && ((isObj(v.runOptions) && v.runOptions.runOn === 'folderOpen') || v.runOn === 'folderOpen')) { const cs = collectStrings(isObj(v.runOptions) ? v : (parent || v), 50); if (cs.truncated) out.truncated = true; out.push(cs); }
+    if (isObj(v) && ((isObj(v.runOptions) && v.runOptions.runOn === 'folderOpen') || v.runOn === 'folderOpen')) {
+      // Nested matches would re-collect the same subtree: a total character budget keeps this linear in the file.
+      if (collected > 2 * MAX_BYTES_PER_FILE) { out.truncated = true; continue; }
+      const cs = collectStrings(isObj(v.runOptions) ? v : (parent || v), 50); if (cs.truncated) out.truncated = true;
+      for (const x of cs) collected += x.length;
+      out.push(cs);
+    }
     const kids = Array.isArray(v) ? v : Object.values(v);
     if (kids.length > 200) out.truncated = true;
     for (const x of kids.slice(0, 200)) stack.push([x, v, d + 1]);
