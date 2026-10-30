@@ -111,7 +111,7 @@ function topLevelPermissions(recs) {
 // A key/value or block scalar inside a step span. Returns {lines:[{n,text}], inline}.
 function readValue(recs, i, keyIndent, spanEnd) {
   const after = recs[i].raw.slice(recs[i].raw.indexOf(':') + 1).replace(/\s+#.*$/, '').trim();
-  if (/^[|>][+-]?\d*$/.test(after)) {
+  if (/^[|>](?:\d[+-]?|[+-]\d?)?$/.test(after)) {
     const end = Math.min(blockEnd(recs, i + 1, keyIndent), spanEnd);
     return { block: true, lines: recs.slice(i + 1, end).filter((r) => !r.raw.trim().startsWith('#') || true).map((r) => ({ n: r.n, text: r.raw })), next: end };
   }
@@ -168,7 +168,7 @@ function parseSteps(recs) {
             else if (cm[1] === 'script') {
               // github-script body: inline or block scalar
               const rest = cm[2].replace(/\s+#.*$/, '').trim();
-              if (/^[|>][+-]?\d*$/.test(rest)) {
+              if (/^[|>](?:\d[+-]?|[+-]\d?)?$/.test(rest)) {
                 let z = q + 1; while (z < v.lines.length && (!v.lines[z].text.trim() || indentOf(v.lines[z].text) > childIndent)) z++;
                 step.script = v.lines.slice(q + 1, z); q = z - 1;
               } else step.script = [{ n: ln.n, text: rest }];
@@ -297,8 +297,15 @@ function analyzeWorkflow(text) {
     const consumed = new Set();
     for (const st of steps) for (const l of [...st.run, ...st.script, ...st.env, ...st.withRef]) consumed.add(l.n);
     const PLAIN = /^\s*(?:-\s+)?[\"']?(?!run\b|script\b)[A-Za-z_][\w-]*[\"']?\s*:\s*[\"']?\$\{\{[^}{\[]*\}\}[\"']?\s*$/;
+    // Lines inside a block scalar (key: | or >) are text, never mapping keys, so the plain-assignment exemption
+    // must not apply to them (review round 3: a body line shaped like `x: ${{ ... }}` hid inside `run: |`).
+    const inBlock = new Set();
+    for (let q = 0; q < live.length; q++) {
+      if (!/[:-]\s*[|>](?:\d[+-]?|[+-]\d?)?\s*(#.*)?$/.test(live[q].raw)) continue;
+      let z = q + 1; while (z < live.length && (isBlank(live[z].raw) || live[z].indent > live[q].indent)) { inBlock.add(live[z].n); z++; }
+    }
     for (const r of live) {
-      if (consumed.has(r.n) || PLAIN.test(r.raw)) continue;
+      if (consumed.has(r.n) || (PLAIN.test(r.raw) && !inBlock.has(r.n))) continue;
       const hit = exprs(r.raw).find(isUntrusted);
       if (hit) add({ rule: 'WFI-006', severity: 'medium', verdict: 'REVIEW', line: r.n, step: 0, stepName: '', expression: clip(hit, 80),
         message: `Event text (${clip(hit, 80)}) appears on a line this check could not place inside a step it understands, so it could not tell whether it reaches a shell script.`,
