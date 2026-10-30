@@ -125,7 +125,7 @@ function readValue(recs, i, keyIndent, spanEnd) {
 function parseSteps(recs) {
   const steps = [];
   for (let i = 0; i < recs.length; i++) {
-    if (!/^\s*["']?steps["']?\s*:\s*(#.*)?$/.test(recs[i].raw)) continue;
+    if (!/^\s*["']?steps["']?\s*:\s*(?:![^\s]*\s*)?(#.*)?$/.test(recs[i].raw)) continue;
     const stepsIndent = recs[i].indent;
     // The list may be indented under the key or aligned with it (both are valid YAML).
     let end = i + 1;
@@ -299,16 +299,21 @@ function analyzeWorkflow(text) {
     // Positive rule (review round 4): a line is data only if it is a direct child of an env: or with: key, or an
     // if: condition, and is a plain single-line assignment. Anything else with event text is reported, whatever
     // its shape. Parent keys are tracked with an indent stack, so this is one linear pass.
-    const PLAIN = /^\s*[\"']?[A-Za-z_][\w-]*[\"']?\s*:\s*[\"']?\$\{\{[^}{\[]*\}\}[\"']?\s*$/;
-    const IFLINE = /^\s*(?:-\s+)?if\s*:/;
+    const PLAIN = /^\s*[\"']?(?!run\b|script\b)[A-Za-z_][\w-]*[\"']?\s*:\s*[\"']?\$\{\{[^}{\[]*\}\}[\"']?\s*$/;
+    const IFLINE = /^\s*(?:-\s+)?if\s*:\s*[\"']?\$\{\{[^}{\[]*\}\}[\"']?\s*$/;   // a complete single-line condition
     const KEYLINE = /^\s*(?:-\s+)?[\"']?([A-Za-z_][\w-]*)[\"']?\s*:/;
     const stack = [];   // [{ indent, key }]
     const dataLine = new Set();
+    const BLOCK_END = /:\s*(?:(?:![^\s]*|&[^\s]+)\s+)*[|>](?:\d[+-]?|[+-]\d?)?\s*(#.*)?$/;
+    let blockIndent = -1;   // lines deeper than this belong to a block scalar: text, never keys
     for (const r of live) {
       if (isBlank(r.raw)) continue;
+      if (blockIndent >= 0 && r.indent > blockIndent) continue;
+      blockIndent = -1;
       while (stack.length && stack[stack.length - 1].indent >= r.indent) stack.pop();
       const parent = stack.length ? stack[stack.length - 1].key : '';
-      if ((PLAIN.test(r.raw) && (parent === 'env' || parent === 'with')) || (IFLINE.test(r.raw) && !/[|>]\s*$/.test(r.raw))) dataLine.add(r.n);
+      if ((PLAIN.test(r.raw) && (parent === 'env' || parent === 'with')) || IFLINE.test(r.raw)) dataLine.add(r.n);
+      if (BLOCK_END.test(r.raw)) blockIndent = r.indent;
       const km = KEYLINE.exec(r.raw);
       if (km) stack.push({ indent: r.indent, key: km[1] });
     }
