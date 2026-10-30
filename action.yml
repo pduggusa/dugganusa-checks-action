@@ -1,5 +1,5 @@
 name: DugganUSA Checks
-description: Pre-merge checks for malicious packages, risky GitHub Actions, MCP servers and hidden text in agent instruction files.
+description: Pre-merge checks: malicious packages, risky Actions, MCP servers, workflow script injection, hidden text in agent files.
 author: DugganUSA LLC
 branding:
   icon: shield
@@ -44,6 +44,10 @@ inputs:
     default: auto
   check-mcp:
     description: Check MCP server configs (any mcp.json or *.mcp.json, claude_desktop_config.json, .claude/settings.json, .vscode/settings.json, .gemini/settings.json, .cursor/settings.json) with Dredd.
+    required: false
+    default: 'true'
+  check-workflow-injection:
+    description: Check workflow files for script injection (event text such as an issue or pull request title, a comment, a branch name or a commit message pasted into a shell script or github-script body, and related patterns). A finding is BLOCK or REVIEW, so with the default fail-on it can fail a pull request that adds or changes one. Set false to turn the check off.
     required: false
     default: 'true'
   max-lookups:

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 - 2026-10-30
+
+- **Workflow script injection.** Workflow files are now checked for event text (an issue or pull request title or body, a comment, a branch name, a commit message) pasted into a `run:` script or `github-script` body, where the shell or JavaScript executes it. Also flagged: a privileged trigger that checks out the pull request head (BLOCK), an environment value re-evaluated by `eval`/`sh -c`/`source`, an external trigger with open permissions (REVIEW), and an AI agent action on a privileged trigger (advisory). Prompted by Radware's 2026-10-29 report of a campaign that hid shell commands in issue and pull request text across 61 repositories. Local, no API call, linear-time, bounded input.
+- New input `check-workflow-injection` (default `true`). **Upgrade note:** a repository whose workflow has a genuinely injectable step will start failing under the default `fail-on: block`. Set `check-workflow-injection: false` to defer, but fixing it is the point: pass the value through `env:` and read it as `"$VAR"`.
+- The findings table labels these rows "workflow injection" instead of "agent instructions".
+
 ## 1.1.2 - 2026-10-19
 
 - A keyless run now shows a notice annotation and a summary link to a free API key, with the secret name to add. Nothing else changes: keyless runs still work at anonymous limits.

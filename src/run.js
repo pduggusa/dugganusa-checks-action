@@ -146,7 +146,7 @@ function parseAllowAmbiguous(text) {
 // including codes added later and an entry with no recorded reason, is non-waivable.
 function nonWaivable(reasons) { return (Array.isArray(reasons) && reasons.length ? reasons : ['other']).filter(c => !parsers.WAIVABLE.has(c)); }
 
-function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter, allowAmbiguous = new Set() }) {
+function collect({ cwd, mode, base, includeTransitive, checkMcp, checkWorkflowInjection = true, pathFilter, allowAmbiguous = new Set() }) {
   const notes = [];
   let files;
   if (mode === 'diff') {
@@ -192,7 +192,7 @@ function collect({ cwd, mode, base, includeTransitive, checkMcp, pathFilter, all
     const oldBuf = mode === 'diff' ? showAt(cwd, base, f) : null;
     const readNew = (rel) => { try { return parsers.decode('requirements', safeRead(cwd, rel)); } catch { return null; } };
     const readOld = (rel) => { const b = showAt(cwd, base, rel); if (!b) return null; try { return parsers.decode('requirements', b); } catch { return null; } };
-    const { items, errors } = parsers.diffItems(kind, oldBuf, newBuf, { transitive, file: f, readInclude: readNew }, { transitive, file: f, readInclude: readOld });
+    const { items, errors } = parsers.diffItems(kind, oldBuf, newBuf, { transitive, file: f, readInclude: readNew, workflowInjection: checkWorkflowInjection }, { transitive, file: f, readInclude: readOld, workflowInjection: checkWorkflowInjection });
     for (const e of errors) notes.push({ file: f, text: `${f} ${e}`, level: 'warning' });
     for (const it of items) addItem(f, it, newText);
   }
@@ -383,7 +383,7 @@ function summaryMarkdown({ results, counts, failed, modeInfo, notes, failOn, fai
     const sorted = [...results].sort((a, b) => ORDER[a.verdict] - ORDER[b.verdict] || label(a.item).localeCompare(label(b.item)));
     for (const r of sorted) {
       const i = r.item;
-      const type = i.kind === 'mcp' ? 'MCP server' : i.kind === 'finding' ? 'agent instructions' : i.kind === 'skip' ? 'source' : `${i.ecosystem}${i.transitive ? ' (transitive)' : ''}`;
+      const type = i.kind === 'mcp' ? 'MCP server' : i.kind === 'finding' ? (i.ftype || 'agent instructions') : i.kind === 'skip' ? 'source' : `${i.ecosystem}${i.transitive ? ' (transitive)' : ''}`;
       L.push(`| ${icon(r)} | ${type} | <code>${mdCell(label(i))}</code> | ${mdCell(i.version || '—')} | ${mdCell(i.files.join(', '))} | ${mdCell(r.reason)} | ${mdCell((r.evidence || []).join(', ') || '—')} |`);
     }
   } else {

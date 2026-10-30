@@ -29,6 +29,7 @@ async function main() {
   const ratePerMin = parseInt(gha.getInput('rate-per-minute', '0'), 10) || undefined;
   const maxWaitMs = Math.max(0, parseInt(gha.getInput('max-wait-seconds', '300'), 10) || 0) * 1000;
   const checkMcp = gha.getBool('check-mcp', true);
+  const checkWorkflowInjection = gha.getBool('check-workflow-injection', true);
   const workspace = fs.realpathSync(process.env.GITHUB_WORKSPACE || process.cwd());
   const wdInput = gha.getInput('working-directory', '.');
   const workdir = fs.realpathSync(path.resolve(workspace, wdInput));
@@ -45,7 +46,7 @@ async function main() {
   }
   gha.log(`DugganUSA Checks: ${modeInfo.reason}`);
 
-  const { items, notes, files, texts, transitive } = run.collect({ cwd: workdir, mode: modeInfo.mode, base: modeInfo.base, includeTransitive, checkMcp, allowAmbiguous });
+  const { items, notes, files, texts, transitive } = run.collect({ cwd: workdir, mode: modeInfo.mode, base: modeInfo.base, includeTransitive, checkMcp, checkWorkflowInjection, allowAmbiguous });
   gha.log(`DugganUSA Checks: ${files.length} manifest/config file(s), ${items.length} item(s) to check`);
 
   const client = new run.Client({ apiBase, apiKey, repository: publicRepository(event, process.env.GITHUB_REPOSITORY), packageRatePerMin: ratePerMin, maxWaitMs, log: (m) => gha.log(`  ${m}`) });

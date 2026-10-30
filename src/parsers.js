@@ -1058,7 +1058,7 @@ function fromInstallConfig(text, { file = '' } = {}) {
 //   owner/repo[/path]@main | other   -> branch ref: moves under you, reported as not_in_corpus
 //   ./local, docker://image          -> not a registry action, noted
 //   ${{ ... }} anywhere              -> unresolvable statically, ambiguous
-function fromWorkflow(text) {
+function fromWorkflow(text, opts = {}) {
   const m = new Map();
   const lines = String(text).split(/\r?\n/);
   lines.forEach((line, i) => {
@@ -1090,6 +1090,8 @@ function fromWorkflow(text) {
       m.set(`skip:uses:${ref}`, { ...notInCorpus(ref, `branch or non-version ref "${r}": it moves, so nothing pins what runs; pin a full commit SHA`), where });
     }
   });
+  // Script injection (2026-10-30, from Radware's report): event text pasted into a shell script. On by default.
+  if (opts.workflowInjection !== false) for (const [k, v] of require('./workflow-injection').fromWorkflowInjection(text)) m.set(k, v);
   return m;
 }
 
@@ -1103,7 +1105,7 @@ function parse(kind, text, opts = {}) {
     case 'gemfile': return fromGemfile(text);
     case 'gemfile.lock': return fromGemfileLock(text);
     case 'mcp': return fromMcpConfig(text);
-    case 'workflow': return fromWorkflow(text);
+    case 'workflow': return fromWorkflow(text, opts);
     case 'instructions': return require('./instructions').fromInstructions(text);
     case 'unsupported': return fromUnsupported(text, opts);
     case 'install-config': return fromInstallConfig(text, opts);
