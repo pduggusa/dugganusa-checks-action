@@ -39,9 +39,12 @@ const UNTRUSTED = [
   /\bgithub\.event\.workflow_run\.(head_branch|display_title|head_commit\.(message|author\.(name|email)))\b/,
   /\bgithub\.event\.pages(\[[^\]]*\]|\.\*)\.page_name\b/,
   /\bgithub\.event\.(issue|pull_request|discussion)\.labels\b/,
-  /\btoJSON\(\s*github\.event\s*\)/,
+  /\btojson\(\s*github\.event\s*\)/,
 ];
-const isUntrusted = (expr) => UNTRUSTED.some((re) => re.test(expr));
+// GitHub expressions are case-insensitive and accept github.event['issue']["title"] for github.event.issue.title,
+// so normalize both before matching (review of 2026-10-30: either spelling slipped past the patterns).
+const normalizeExpr = (expr) => String(expr).toLowerCase().replace(/\[\s*(['"])([a-z0-9_*-]{1,40})\1\s*\]/g, '.$2').replace(/\s+/g, ' ');
+const isUntrusted = (expr) => { const n = normalizeExpr(expr); return UNTRUSTED.some((re) => re.test(n)); };
 
 // Triggers whose events any GitHub user can cause, and that run with the repository's secrets or a
 // write token. (pull_request from a fork has neither, which lowers the blast radius, not the bug.)
@@ -120,7 +123,7 @@ function readValue(recs, i, keyIndent, spanEnd) {
 function parseSteps(recs) {
   const steps = [];
   for (let i = 0; i < recs.length; i++) {
-    if (!/^\s*steps\s*:\s*$/.test(recs[i].raw)) continue;
+    if (!/^\s*["']?steps["']?\s*:\s*(#.*)?$/.test(recs[i].raw)) continue;
     const stepsIndent = recs[i].indent;
     // The list may be indented under the key or aligned with it (both are valid YAML).
     let end = i + 1;
@@ -142,7 +145,7 @@ function parseSteps(recs) {
       for (let k = 0; k < span.length; k++) {
         const r = span[k];
         if (isBlank(r.raw) || r.indent !== keyIndent) continue;
-        const km = /^\s*([A-Za-z_][\w-]*)\s*:/.exec(r.raw);
+        const km = /^\s*["']?([A-Za-z_][\w-]*)["']?\s*:/.exec(r.raw);
         if (!km) continue;
         const key = km[1];
         if (key === 'name') step.name = clip(r.raw.slice(r.raw.indexOf(':') + 1).replace(/^["']|["']$/g, ''), 60);
@@ -185,7 +188,7 @@ function exprs(text) {
 }
 
 function analyzeWorkflow(text) {
-  const result = { analyzed: false, triggers: [], findings: [], coverage: ['WFI-001 event text in run or script', 'WFI-002 privileged trigger checks out the pull request head', 'WFI-003 event text reaches eval or sh -c through env', 'WFI-004 external trigger with open token permissions', 'WFI-005 AI agent action on an external trigger'], note: 'No findings means none of these patterns were seen. It does not mean the workflow is safe.' };
+  const result = { analyzed: false, triggers: [], findings: [], coverage: ['WFI-001 event text in run or script', 'WFI-002 privileged trigger checks out the pull request head', 'WFI-003 event text reaches eval or sh -c through env', 'WFI-004 external trigger with open token permissions', 'WFI-005 AI agent action on an external trigger', 'WFI-006 event text in a workflow whose steps could not be parsed'], note: 'No findings means none of these patterns were seen. It does not mean the workflow is safe.' };
   if (typeof text !== 'string') { result.error = 'workflow must be text'; return result; }
   if (Buffer.byteLength(text, 'utf8') > MAX_BYTES) { result.error = 'workflow is larger than 200 KB, not analyzed'; return result; }
   const lines = text.replace(/^﻿/, '').split(/\r\n|\r|\n/);
@@ -284,6 +287,16 @@ function analyzeWorkflow(text) {
         fix: 'Give the job the least token permission it needs, keep secrets out of its environment, and separate what reads outside text from what holds keys.' });
     }
   }
+  // WFI-006: the line-based parser found no steps in a file that has jobs or runs. Do not report a quiet "no
+  // findings": any untrusted expression anywhere in the file is surfaced for a person to read.
+  if (!steps.length && live.some((r) => r.indent === 0 && /^["']?(jobs|runs)["']?\s*:/.test(r.raw))) {
+    for (const r of live) {
+      const hit = exprs(r.raw).find(isUntrusted);
+      if (hit) add({ rule: 'WFI-006', severity: 'medium', verdict: 'REVIEW', line: r.n, step: 0, stepName: '', expression: clip(hit, 80),
+        message: `Event text (${clip(hit, 80)}) appears in a workflow whose steps could not be parsed here, so it was not possible to tell whether it reaches a shell script.`,
+        fix: 'Read the step by hand. If the value reaches a run: script or a github-script body, pass it through env: and use "$NAME" instead.' });
+    }
+  }
   // WFI-004: external trigger with open permissions
   if (priv.length && (perms.writeAll || (!perms.declared))) {
     add({ rule: 'WFI-004', severity: 'medium', verdict: 'REVIEW', line: 1, step: 0, stepName: '', expression: perms.writeAll ? 'permissions: write-all' : 'no permissions block',
@@ -309,8 +322,13 @@ function fromWorkflowInjection(text) {
     if (/larger than|more than/.test(r.error || '')) m.set('skip:wfi:unanalyzed', { kind: 'skip', unverifiable: true, cls: 'ambiguous', spec: 'workflow script-injection check', reason: `${r.error}; the workflow was not checked for script injection`, where: 'line 1' });
     return m;
   }
+  const seen = new Map();
   for (const f of r.findings) {
-    m.set(`finding:wfi:${f.rule}:${f.stepName || f.step}:${f.expression}`, {
+    // An occurrence number keeps a second identical finding (same step name, same expression) from collapsing
+    // into the first and hiding an added copy in a pull request diff.
+    const base = `finding:wfi:${f.rule}:${f.stepName || f.step}:${f.expression}`;
+    const n = (seen.get(base) || 0) + 1; seen.set(base, n);
+    m.set(`${base}#${n}`, {
       kind: 'finding', ftype: 'workflow injection', verdict: f.verdict, severity: f.severity,
       spec: `${f.rule} line ${f.line}: ${f.expression}`, where: `line ${f.line}`, reason: `${f.message} Fix: ${f.fix}`,
     });
