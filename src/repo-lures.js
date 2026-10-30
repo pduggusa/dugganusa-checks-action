@@ -146,9 +146,10 @@ function collectStrings(node, limit = 400) {
 }
 // Short digest of the text a finding rests on, so a pull request that CHANGES a command re-triggers the finding even when
 // its description is the same words (the Action diffs findings by identity).
-// Hashes ALL the content the finding rests on, each distinct string once: the input is bounded by the size of the file it
-// came from (at most 200 KB), so no cap is needed and nothing is left out of the identity.
-const digest = (strings) => crypto.createHash('sha256').update([...new Set(strings.map(String))].join('\n')).digest('hex').slice(0, 12);
+// Hashes EVERY string the finding rests on, in order, each with its length, so neither a duplicate nor a re-split can make two
+// different contents hash alike. Input is bounded by the collectors (each draws from one file of at most 200 KB, and
+// findRunOnOpen has its own total budget), so no cap is needed.
+const digest = (strings) => { const h = crypto.createHash('sha256'); for (const x of strings) { const str = String(x); h.update(str.length + ':'); h.update(str); } return h.digest('hex').slice(0, 12); };
 // Every object in the tree that sets runOn to folderOpen (anywhere, not only under tasks), with the strings around it.
 function findRunOnOpen(doc) {
   const out = []; const stack = [[doc, null, 0]]; let seen = 0, collected = 0;

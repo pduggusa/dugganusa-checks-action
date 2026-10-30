@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0 - 2026-10-30
+
+- **Run-on-open and install-time lures.** Pull requests are now checked for files that run code when a folder is opened or installed, which a dependency check never reads: npm install hooks (and `binding.gyp`) that fetch or evaluate code, a VS Code task set to run when the folder opens (also inside `.code-workspace`), agent hooks and helper commands in `.claude/settings.json`, dev container lifecycle commands (`initializeCommand` runs on the host), `yarnPath`, yarn plugins, `.pnpmfile.cjs`, a foreign npm registry and npm config keys that name a program. Local, no API call, bounded and linear. Only what a pull request adds or changes is reported, and a changed command is a new finding.
+- New input `check-repo-lures` (default `true`). **Upgrade note:** a repository that already has, for example, a `postinstall` that downloads and runs a script will start failing a pull request that touches it under the default `fail-on: block`. Set `check-repo-lures: false` to defer.
+- The same analyzer also runs as the `check-repo` MCP tool and a command line scanner (see the repository documentation). The analyzer was reviewed adversarially before release; two denial-of-service cases, output-injection paths and several ways to hide a lure were fixed.
+
 ## 1.2.2 - 2026-10-30
 
 - **Performance fix:** the workflow-injection reader took about 10 seconds on a single 180 KB line of repeated colons and tags (an unanchored pattern). Lines are now capped and the pattern anchored; the same input runs in under a millisecond. A pathological workflow could stall a job's own check, never anything else.

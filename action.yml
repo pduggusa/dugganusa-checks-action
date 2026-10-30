@@ -1,5 +1,5 @@
 name: DugganUSA Checks
-description: Pre-merge checks: malicious packages, risky Actions, MCP servers, workflow script injection, hidden text in agent files.
+description: Pre-merge checks: malicious packages, risky Actions, MCP servers, workflow injection, run-on-open lures, hidden text.
 author: DugganUSA LLC
 branding:
   icon: shield

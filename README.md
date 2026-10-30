@@ -124,6 +124,7 @@ Every ambiguous MCP entry prints its fingerprint in the summary's Evidence colum
 | `include-transitive` | `auto` | Lockfile transitives: yes in diff mode, no in full scans |
 | `check-mcp` | `true` | Check MCP server configs with Dredd |
 | `check-workflow-injection` | `true` | Check workflow files for script injection (event text pasted into a `run:` script). A finding can fail the PR under the default `fail-on`. Local, no API call |
+| `check-repo-lures` | `true` | Check for run-on-open and install-time lures: install hooks that fetch or evaluate code, VS Code tasks that run when the folder opens, agent hooks, dev container commands, `yarnPath` and similar. A finding can fail the PR under the default `fail-on`. Local, no API call |
 | `max-lookups` | `200` | Lookup cap per run; the rest are reported UNKNOWN: unchecked |
 | `rate-per-minute` | auto | Client-side pacing for package lookups (10/min keyless, 60/min keyed) |
 | `max-wait-seconds` | `300` | Total time the run may wait out HTTP 429s |
