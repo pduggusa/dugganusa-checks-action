@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1 - 2026-10-30
+
+- Workflow injection check hardened after an independent review of 1.2.0: event fields are matched case-insensitively and in bracket form (`github.event.issue['title']`); whole-object and wildcard references (`toJSON(github.event.issue)`, `github.event.issue.*`) count as event text; a step the line-based parser cannot read (flow style, odd quoting) is reported as REVIEW `WFI-006` per line instead of passing silently; a second identical finding in a pull request diff is no longer collapsed into the first.
+
 ## 1.2.0 - 2026-10-30
 
 - **Workflow script injection.** Workflow files are now checked for event text (an issue or pull request title or body, a comment, a branch name, a commit message) pasted into a `run:` script or `github-script` body, where the shell or JavaScript executes it. Also flagged: a privileged trigger that checks out the pull request head (BLOCK), an environment value re-evaluated by `eval`/`sh -c`/`source`, an external trigger with open permissions (REVIEW), and an AI agent action on a privileged trigger (advisory). Prompted by Radware's 2026-10-29 report of a campaign that hid shell commands in issue and pull request text across 61 repositories. Local, no API call, linear-time, bounded input.
