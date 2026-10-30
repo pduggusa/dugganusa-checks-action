@@ -50,6 +50,8 @@ function manifestKind(file) {
   if (/(^|\/)(node_modules|vendor\/bundle|\.venv|venv)\//.test(f)) return null;
   const b = base(f);
   if (b === 'package.json') return 'package.json';
+  // Run-on-open and container lifecycle files (2026-10-30): nothing else reads them.
+  if (/(^|\/)\.vscode\/tasks\.json$/.test(f) || /(^|\/)\.devcontainer\/devcontainer\.json$/.test(f) || b === '.devcontainer.json') return 'lure';
   if (b === 'package-lock.json' || b === 'npm-shrinkwrap.json') return 'package-lock';
   if (/^requirements.*\.txt$/i.test(b) || /\.requirements\.txt$/i.test(b)) return 'requirements';
   if (/^requirements.*\.in$/i.test(b) || /\.requirements\.in$/i.test(b)) return 'unsupported'; // pip-compile input: what it resolves to is not in it
@@ -1096,6 +1098,15 @@ function fromWorkflow(text, opts = {}) {
 }
 
 function parse(kind, text, opts = {}) {
+  const out = parseBase(kind, text, opts);
+  // Lure rules ride along on the kinds whose files they read (2026-10-30). Off with opts.repoLures === false.
+  if (opts.repoLures !== false && opts.file && (kind === 'package.json' || kind === 'mcp' || kind === 'install-config' || kind === 'lure')) {
+    for (const [k, v] of require('./repo-lures').fromRepoLures(opts.file, text)) out.set(k, v);
+  }
+  return out;
+}
+
+function parseBase(kind, text, opts = {}) {
   switch (kind) {
     case 'package.json': return fromPackageJson(text);
     case 'package-lock': return fromPackageLock(text, opts);

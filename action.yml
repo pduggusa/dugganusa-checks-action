@@ -50,6 +50,10 @@ inputs:
     description: Check workflow files for script injection (event text such as an issue or pull request title, a comment, a branch name or a commit message pasted into a shell script or github-script body, and related patterns). A finding is BLOCK or REVIEW, so with the default fail-on it can fail a pull request that adds or changes one. Set false to turn the check off.
     required: false
     default: 'true'
+  check-repo-lures:
+    description: Check for run-on-open and install-time lures that a dependency check never reads (an npm install hook that fetches or evaluates code, a VS Code task set to run when the folder opens, agent hooks, dev container commands, yarnPath). A finding is BLOCK or REVIEW, so with the default fail-on it can fail a pull request that adds one. Set false to turn the check off.
+    required: false
+    default: 'true'
   max-lookups:
     description: Maximum API lookups per run. Items past the cap are reported as UNKNOWN (unchecked, which fails by default since a PR can pad itself past a cap), never as passed.
     required: false
