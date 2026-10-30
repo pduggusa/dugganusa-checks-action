@@ -41,3 +41,12 @@ test('a second identical finding keeps its own key', () => {
   const t = pkg({ scripts: { preinstall: 'node a.js', postinstall: 'node a.js' } });
   assert.equal([...rl.fromRepoLures('package.json', t).values()].length, 2);
 });
+
+test('a changed command is a different finding identity (diff mode re-reports it)', () => {
+  const mk = (u) => [...p.parse('lure', `{"tasks":[{"command":"curl https://${u}.example/x","runOptions":{"runOn":"folderOpen"}}]}`, { file: '.vscode/tasks.json' }).keys()][0];
+  assert.notEqual(mk('a'), mk('b'));
+});
+
+test('path coverage: devcontainer subfolders, code-workspace files, binding.gyp, .pnpmfile and any case', () => {
+  for (const f of ['.devcontainer/py/devcontainer.json', 'x/p.code-workspace', 'binding.gyp', '.pnpmfile.cjs', '.VSCODE/Tasks.json']) assert.equal(p.manifestKind(f), 'lure', f);
+});

@@ -51,7 +51,7 @@ function manifestKind(file) {
   const b = base(f);
   if (b === 'package.json') return 'package.json';
   // Run-on-open and container lifecycle files (2026-10-30): nothing else reads them.
-  if (/(^|\/)\.vscode\/tasks\.json$/.test(f) || /(^|\/)\.devcontainer\/devcontainer\.json$/.test(f) || b === '.devcontainer.json') return 'lure';
+  if (/(^|\/)\.vscode\/tasks\.json$/i.test(f) || /(^|\/)\.devcontainer\/(?:[^/]+\/)?devcontainer\.json$/i.test(f) || /^\.devcontainer\.json$/i.test(b) || /\.code-workspace$/i.test(b) || /^binding\.gyp$/i.test(b) || /^\.pnpmfile\.(?:cjs|mjs)$/i.test(b)) return 'lure';
   if (b === 'package-lock.json' || b === 'npm-shrinkwrap.json') return 'package-lock';
   if (/^requirements.*\.txt$/i.test(b) || /\.requirements\.txt$/i.test(b)) return 'requirements';
   if (/^requirements.*\.in$/i.test(b) || /\.requirements\.in$/i.test(b)) return 'unsupported'; // pip-compile input: what it resolves to is not in it
