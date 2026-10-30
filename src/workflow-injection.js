@@ -39,11 +39,13 @@ const UNTRUSTED = [
   /\bgithub\.event\.workflow_run\.(head_branch|display_title|head_commit\.(message|author\.(name|email)))\b/,
   /\bgithub\.event\.pages(\[[^\]]*\]|\.\*)\.page_name\b/,
   /\bgithub\.event\.(issue|pull_request|discussion)\.labels\b/,
-  /\btojson\(\s*github\.event\s*\)/,
+  /\btojson\(\s*github(\.event(\.[a-z_]+)*)?\s*\)/,                      // serializes everything below it
+  /\bgithub\.event(\.[a-z_]+)*\.\*/,                                       // object filter over event fields
+  /\bgithub\.event\.(issue|pull_request|discussion|comment|review|review_comment|head_commit|workflow_run)(?![\w.[])/,   // the bare object stringifies to JSON including title and body
 ];
 // GitHub expressions are case-insensitive and accept github.event['issue']["title"] for github.event.issue.title,
 // so normalize both before matching (review of 2026-10-30: either spelling slipped past the patterns).
-const normalizeExpr = (expr) => String(expr).toLowerCase().replace(/\[\s*(['"])([a-z0-9_*-]{1,40})\1\s*\]/g, '.$2').replace(/\s+/g, ' ');
+const normalizeExpr = (expr) => String(expr).toLowerCase().replace(/\[\s*(['"])([a-z0-9_*-]{1,40})\1\s*\]/g, '.$2').replace(/\s*([.\[\]])\s*/g, '$1').replace(/\s+/g, ' ');
 const isUntrusted = (expr) => { const n = normalizeExpr(expr); return UNTRUSTED.some((re) => re.test(n)); };
 
 // Triggers whose events any GitHub user can cause, and that run with the repository's secrets or a
@@ -287,13 +289,19 @@ function analyzeWorkflow(text) {
         fix: 'Give the job the least token permission it needs, keep secrets out of its environment, and separate what reads outside text from what holds keys.' });
     }
   }
-  // WFI-006: the line-based parser found no steps in a file that has jobs or runs. Do not report a quiet "no
-  // findings": any untrusted expression anywhere in the file is surfaced for a person to read.
-  if (!steps.length && live.some((r) => r.indent === 0 && /^["']?(jobs|runs)["']?\s*:/.test(r.raw))) {
+  // WFI-006: decide per line. The parser is line-based, so a step it could not read (flow style, odd quoting)
+  // would otherwise pass silently, even in a file where other steps parsed. Any line with event text that the
+  // parser did not consume is reported, unless it is a plain `key: ${{ ... }}` assignment (job-level env, with:
+  // inputs, if: conditions), which is data and not code. run: and script: values are never plain data.
+  if (live.some((r) => r.indent === 0 && /^[\"']?(jobs|runs)[\"']?\s*:/.test(r.raw))) {
+    const consumed = new Set();
+    for (const st of steps) for (const l of [...st.run, ...st.script, ...st.env, ...st.withRef]) consumed.add(l.n);
+    const PLAIN = /^\s*(?:-\s+)?[\"']?(?!run\b|script\b)[A-Za-z_][\w-]*[\"']?\s*:\s*[\"']?\$\{\{[^}{\[]*\}\}[\"']?\s*$/;
     for (const r of live) {
+      if (consumed.has(r.n) || PLAIN.test(r.raw)) continue;
       const hit = exprs(r.raw).find(isUntrusted);
       if (hit) add({ rule: 'WFI-006', severity: 'medium', verdict: 'REVIEW', line: r.n, step: 0, stepName: '', expression: clip(hit, 80),
-        message: `Event text (${clip(hit, 80)}) appears in a workflow whose steps could not be parsed here, so it was not possible to tell whether it reaches a shell script.`,
+        message: `Event text (${clip(hit, 80)}) appears on a line this check could not place inside a step it understands, so it could not tell whether it reaches a shell script.`,
         fix: 'Read the step by hand. If the value reaches a run: script or a github-script body, pass it through env: and use "$NAME" instead.' });
     }
   }
