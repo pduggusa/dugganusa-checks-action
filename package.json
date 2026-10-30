@@ -1,6 +1,6 @@
 {
   "name": "dugganusa-checks-action",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "description": "GitHub Action: pre-install membrane checks for dependencies and MCP servers on pull requests",
   "license": "MIT",

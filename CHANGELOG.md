@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2 - 2026-10-30
+
+- **Performance fix:** the workflow-injection reader took about 10 seconds on a single 180 KB line of repeated colons and tags (an unanchored pattern). Lines are now capped and the pattern anchored; the same input runs in under a millisecond. A pathological workflow could stall a job's own check, never anything else.
+- Detection hardening: block scalars with tags or anchors, `|2-` and `|-2` indicators, multi-line quoted and plain scalar continuations, and `if:` lines are no longer treated as data when they sit inside a scalar; a line is exempt only as a direct child of `env:` or `with:` or as a complete single-line `if:` condition. `run:` and `script:` values are never exempt.
+
 ## 1.2.1 - 2026-10-30
 
 - Workflow injection check hardened after an independent review of 1.2.0: event fields are matched case-insensitively and in bracket form (`github.event.issue['title']`); whole-object and wildcard references (`toJSON(github.event.issue)`, `github.event.issue.*`) count as event text; a step the line-based parser cannot read (flow style, odd quoting) is reported as REVIEW `WFI-006` per line instead of passing silently; a second identical finding in a pull request diff is no longer collapsed into the first.
